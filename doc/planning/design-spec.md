@@ -77,33 +77,20 @@ tree is a *serialization*, not our source of truth. Our source of truth is the d
 
 ## 3. System shape
 
-```
-                        ┌─────────────────────────────────────────────┐
-   other agents ───────▶│  MEMORY INGEST API  (Litestar, async)        │
-   (hot path)           │  POST raw dump → durable write → 202 + enqueue│
-                        └───────────────┬─────────────────────────────┘
-                                        │ (Postgres-native queue: one txn)
-                                        ▼
-                        ┌─────────────────────────────────────────────┐
-   cron ───────────────▶│  DERIVATION WORKERS                          │
-   (the dreamer)        │   memory-edit agent → PROPOSED edit          │
-                        │   dreamer agent     → PROPOSED edit          │
-                        └───────────────┬─────────────────────────────┘
-                                        │ every autonomous write
-                                        ▼
-                        ┌─────────────────────────────────────────────┐
-                        │  LLM-AS-JUDGE GATE  (accept / reject / defer) │
-                        └───────────────┬─────────────────────────────┘
-                                        │ accepted
-                                        ▼
-   humans ──OIDC──▶ ┌──────────────┐   │   ┌──────────────────────────┐
-   (admin console)  │ CRUD on      │◀──┴──▶│ concepts (current state)  │
-   htmx UI          │ concepts     │       │  + trigger ─▶ ledger       │
-                    └──────────────┘       │    (append-only full text) │
-                                           └──────────────────────────┘
-                                        ▲                     │
-                        import/export    │                     ▼
-                        (owner/admin) ───┘             OKF tarball ⇄ bundle
+```mermaid
+flowchart TD
+    Agents([Other agents]) -->|raw dump| API[Ingest API]
+    API -.->|202 fast| Agents
+    API ==>|write + enqueue<br/>one txn| Q[(PG queue)]
+    Cron([Cron]) --> Dream[Dreamer]
+    Q --> ME[Memory-edit agent]
+    ME -->|proposal| J{Judge}
+    Dream -->|proposal| J
+    J -->|accepted| C[(Concepts)]
+    J -.->|rejected| V[Verdict log]
+    C -->|trigger| L[(Ledger)]
+    Admins([Admins]) -->|OIDC + htmx| C
+    C <-->|import / export| B[OKF bundle]
 ```
 
 Three planes, one database. The web tier acknowledges fast and hands off; the workers do
