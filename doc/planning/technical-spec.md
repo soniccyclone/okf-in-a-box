@@ -115,7 +115,48 @@ limits, OpenAPI. (Pending — TS4.)_
 _The end-to-end flows, grouped by actor. This is the backbone of the implementation and the
 tests. (Inventory pending — TS5; journeys pending — TS6a–d.)_
 
-### 7.1 Actors and journey catalog _(TS5)_
+### 7.1 Actors and journey catalog
+
+A CUJ here is an **end-to-end flow with a triggering actor, preconditions, numbered steps
+across the tiers, and an observable outcome** — written so it doubles as an integration-test
+script (§8). Each is tagged with an ID (`CUJ-<area><n>`) referenced by the test plan.
+
+**Actors.**
+
+| Actor | Kind | Interface | Trust |
+|---|---|---|---|
+| **Calling agent** | machine (e.g. a CrewAI crew, a Copilot) | machine API (API key / OIDC client-creds), MCP recall | untrusted, high-volume |
+| **Memory-edit agent** | internal worker (CrewAI, non-interactive) | queue → LLM via gateway | untrusted output → judged |
+| **Judge** | internal worker (LLM) | invoked in pipeline | the gate itself |
+| **Dreamer** | internal worker (cron, CrewAI) | scheduled + summonable | untrusted output → judged |
+| **Reader** | human | admin console (OIDC) | read-only |
+| **Editor** | human | admin console | trusted committer (quality-bypass, privacy-gated) |
+| **Admin** | human | admin console | + import, RBAC, review-queue triage |
+| **Owner** | human | env-bootstrapped + console | + everything; ultimate authority |
+| **Operator** | human/CI | shell, env, compose | deploys, configures gateway/IdP/TTL |
+
+**Journey catalog** (specified in §7.2–§7.5):
+
+- **Agent-facing hot path (§7.2, TS6a):** `CUJ-A1` prime at startup · `CUJ-A2` recall
+  (hybrid) · `CUJ-A3` save a raw dump (202 + async) · `CUJ-A4` CrewAI event-bus auto-capture
+  SAVE · `CUJ-A5` recall over MCP.
+- **Autonomous pipeline (§7.3, TS6b):** `CUJ-P1` memory-edit distillation (dump → proposed
+  concept, provenance + citation) · `CUJ-P2` privacy screen (blocks everyone) · `CUJ-P3`
+  quality judge on an agent proposal (accept / reject) · `CUJ-P4` bounded repair retry ·
+  `CUJ-P5` dreamer staleness sweep (dirtiness gate, caps, cooldown) · `CUJ-P6` dreamer
+  reject-rate canary auto-halt · `CUJ-P7` hot-core upkeep (promote/demote under budget).
+- **Human console (§7.4, TS6c):** `CUJ-H1` owner bootstrap + RBAC management · `CUJ-H2`
+  editor direct edit with advisory lint · `CUJ-H3` blast-radius escalation of a human mass
+  edit · `CUJ-H4` review/patrol queue triage · `CUJ-H5` version history time-travel + diff ·
+  `CUJ-H6` browse the wiki as internal docs (progressive disclosure via index).
+- **Admin ops (§7.5, TS6d):** `CUJ-O1` OKF import with git-style conflict diff · `CUJ-O2`
+  summon-dreamer import consolidation · `CUJ-O3` export to OKF tarball (regenerate
+  `index.md`/`log.md`) · `CUJ-O4` configure PII/TTL knobs · `CUJ-O5` configure models against
+  the AI gateway · `CUJ-O6` stand up a sensitive deployment and route to it.
+
+Each journey below states: **Actor · Trigger · Preconditions · Steps (tier-by-tier) ·
+Outcome · Failure paths · Design-spec ref**.
+
 ### 7.2 Agent-facing hot path — prime, recall, save _(TS6a)_
 ### 7.3 Autonomous pipeline — memory-edit, judge, dreamer _(TS6b)_
 ### 7.4 Human console — RBAC, review queue, edit, history _(TS6c)_
