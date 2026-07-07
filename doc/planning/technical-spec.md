@@ -419,10 +419,210 @@ script (§8). Each is tagged with an ID (`CUJ-<area><n>`) referenced by the test
 Each journey below states: **Actor · Trigger · Preconditions · Steps (tier-by-tier) ·
 Outcome · Failure paths · Design-spec ref**.
 
-### 7.2 Agent-facing hot path — prime, recall, save _(TS6a)_
-### 7.3 Autonomous pipeline — memory-edit, judge, dreamer _(TS6b)_
-### 7.4 Human console — RBAC, review queue, edit, history _(TS6c)_
-### 7.5 Admin ops — import, export, sensitive deployment _(TS6d)_
+### 7.2 Agent-facing hot path — prime, recall, save
+
+**CUJ-A1 — Prime at startup.** *Actor:* calling agent. *Trigger:* crew/agent boots.
+*Preconditions:* valid credential; some `is_core` concepts exist (else empty core is a valid
+response). *Steps:* (1) `GET /v1/prime?tags=<domains>&budget=<n>`; (2) auth middleware
+resolves principal+role; (3) service reads `concepts WHERE is_core` (partial index) filtered
+by tag, ordered by centrality/recency, truncated to budget; (4) returns core set. *Outcome:*
+agent pins the hot core in its context and now knows what the org knows and that more can be
+recalled. *Failure paths:* no credential → `401`; empty core → `200` with `[]` (valid).
+*Ref:* §4.17, §6.3.
+
+**CUJ-A2 — Recall (hybrid).** *Actor:* calling agent. *Trigger:* agent needs context for a
+task. *Preconditions:* valid credential. *Steps:* (1) `GET /v1/recall?q=…&tags=…&k=…`;
+(2) service runs FTS (`tsvector`) and vector ANN (HNSW over the query embedding) in parallel;
+(3) fuses with RRF; (4) returns top-k concepts + scores from `concepts` only. *Outcome:*
+agent grounds its work on existing knowledge instead of re-deriving. *Failure paths:* empty
+query → `422`; no matches → `200` `[]`; embedding backend down → degrade to FTS-only + warn
+header (design note, not silent). *Ref:* §4.14, §6.3. *Serves from replicas (§4.13).*
+
+**CUJ-A3 — Save a raw dump (async).** *Actor:* calling agent. *Trigger:* crew finishes a unit
+of work worth remembering. *Preconditions:* credential with write role. *Steps:* (1) `POST
+/v1/memories` with verbatim payload + tags; (2) sanitization seam runs (XSS + org PII scrubber,
+§9); (3) **one transaction**: insert `raw_dumps` + enqueue `derive_concept`; (4) return
+**`202`** `{raw_dump_id}`. *Outcome:* durable capture, fast ack; the agent moves on;
+derivation happens later (→ CUJ-P1). *Failure paths:* oversize `413`; rate `429`; malformed
+`422`; sanitizer hard-fail (e.g. secret detector configured to block) → `422` with reason.
+*Invariant to test:* no concept row is created synchronously on this call. *Ref:* §4.2, §4.1,
+§6.2.
+
+**CUJ-A4 — CrewAI event-bus auto-capture SAVE.** *Actor:* an integrating CrewAI crew (via our
+bundled helper). *Trigger:* `OKFMemory(api_key=…).attach(crew)` registered; a task completes.
+*Preconditions:* helper installed; CrewAI version within the pinned range (§8 test). *Steps:*
+(1) the helper's `BaseEventListener` receives `LLMCallCompletedEvent`/`TaskCompletedEvent`;
+(2) it extracts the **verbatim `messages`** (not the distilled `TaskOutput`); (3) POSTs to
+`/v1/memories` as in CUJ-A3, fire-and-forget. *Outcome:* the true source-of-truth context is
+captured without the agent choosing to, and without a lossy self-summary. *Failure paths:*
+CrewAI event schema drift → CI test fails loudly (the helper must not silently stop
+capturing); service unreachable → helper retries/queues locally then drops with a log.
+*Ref:* design-spec §5, §6.2.
+
+**CUJ-A5 — Recall over MCP.** *Actor:* a non-CrewAI MCP client (Claude Desktop, Cursor, …).
+*Trigger:* client invokes the `recall` (or `prime`) MCP tool. *Preconditions:* MCP server
+configured with a credential. *Steps:* (1) MCP `recall` tool call → (2) thin adapter → same
+service layer as §6.3 → (3) results returned as tool output. *Outcome:* universal
+agent-invoked read across any MCP client. *Failure paths:* as CUJ-A2. *Note:* save is **not**
+a first-class MCP tool (can't capture verbatim context — design-spec §5); any manual MCP save
+is documented as lossy. *Ref:* §6.4.
+
+### 7.3 Autonomous pipeline — memory-edit, judge, dreamer
+
+**CUJ-P1 — Memory-edit distillation.** *Actor:* memory-edit worker. *Trigger:*
+`derive_concept(raw_dump_id)` dequeued (procrastinate). *Preconditions:* raw dump exists;
+gateway reachable. *Steps:* (1) load raw dump; (2) recall related concepts (so it can propose
+an *update* vs. a duplicate `create`); (3) LLM (per-agent gateway model, §4.10) distills →
+generic, de-identified concept body + frontmatter, **citing which dump claims justify which
+content**; (4) write an `edit_proposals` row (`proposer=memory_edit`, `source_raw_dump_id`,
+proposed body); (5) enqueue `judge_proposal`. *Outcome:* a proposal exists; nothing is in
+`concepts` yet. *Failure paths:* gateway error → job retries with backoff (procrastinate);
+dump unparseable → proposal rejected pre-judge with telemetry. *Ref:* §4.2, §4.6.
+
+**CUJ-P2 — Privacy screen (blocks everyone).** *Actor:* judge (privacy screen). *Trigger:*
+any write — an agent proposal *or* a human console commit (§7.4). *Steps:* (1) run the
+privacy/PII/secret screen; (2) on detection → block: for agent proposals set
+`status=rejected` + `judge_verdicts(screen=privacy, reason_class∈{pii,secret})`; for human
+edits block the commit and surface the reason inline. *Outcome:* no secret/PII lands in the
+org-readable corpus regardless of author. *Failure paths:* ambiguous detection → route to
+human review (CUJ-H4), never auto-accept. *Ref:* §4.3 (universal privacy screen), §4.15.
+
+**CUJ-P3 — Quality judge on an agent proposal.** *Actor:* judge (quality). *Trigger:*
+`judge_proposal` dequeued and privacy screen passed. *Preconditions:* judge model differs from
+proposer model (§4.4). *Steps:* (1) evaluate the proposal against quality/consistency criteria
+and related concepts; (2) **accept** → apply to `concepts` (the ledger trigger records the
+version; provenance edge written, prior edges soft-invalidated on supersession) and
+`status=accepted`; **reject** → record `judge_verdicts(screen=quality, reason_class, rationale)`
+and route by reason (→ CUJ-P4 or discard-with-telemetry or CUJ-H4). *Outcome:* only
+judge-approved autonomous content enters the wiki. *Failure paths:* always persist the verdict
+even on discard (reject-rate is the regression alarm, §9). *Ref:* §4.3.
+
+**CUJ-P4 — Bounded repair retry.** *Actor:* memory-edit worker (re-invoked). *Trigger:* a
+**quality** rejection with `attempt < 1`. *Steps:* (1) re-run distillation with the judge's
+**specific structured critique** attached; (2) increment `attempt`; (3) re-judge. *Outcome:* a
+near-miss is rescued once. *Failure paths:* second failure → escalate to review queue
+(CUJ-H4); **privacy** rejections never enter this loop (deterministic redact or human only —
+§4.3). *Invariant to test:* at most one repair (2 total judge passes). *Ref:* §4.3.
+
+**CUJ-P5 — Dreamer staleness sweep.** *Actor:* dreamer. *Trigger:* nightly cron *upper
+bound*, but runs only if the **dirtiness budget** threshold is crossed (else no-op). *Steps:*
+(1) compute dirtiness (stale `okf_timestamp`, orphaned links, duplication, flagged edits);
+(2) if below threshold, exit; (3) else select a **≤200-edit** sample excluding concepts within
+the **7-day cooldown**; (4) propose edits (cheap model triages, expensive model drafts);
+(5) each proposal goes through the judge (CUJ-P2/P3) like any autonomous write. *Outcome:* the
+wiki self-maintains within hard bounds. *Failure paths:* per-run/per-day **gateway budget**
+breach → circuit-breaker halts mid-run; nothing exceeds the edit cap or touches cooling
+records. *Ref:* §4.4.
+
+**CUJ-P6 — Dreamer reject-rate canary auto-halt.** *Actor:* dreamer + judge. *Trigger:*
+during a sweep the judge **reject-rate spikes** past threshold. *Steps:* (1) monitor rolling
+reject-rate of dreamer proposals; (2) on spike → auto-halt the run and alert. *Outcome:* a
+bad dreamer prompt/model can't mass-corrupt — it self-trips. Because edits are
+invalidate-not-delete (§4.5), anything that did land is reversible. *Ref:* §4.4.
+
+**CUJ-P7 — Hot-core upkeep.** *Actor:* dreamer. *Trigger:* sweep includes core maintenance.
+*Steps:* (1) evaluate `is_core` set against the size budget and freshness; (2) propose
+promotions/demotions/merges (through the judge); (3) demotion clears `is_core` but the concept
+**stays in the corpus** (recall still finds it). *Outcome:* the core stays small, fresh, and
+high-signal. *Failure paths:* core over budget → demote lowest-value first; never delete on
+demote. *Ref:* §4.17, §4.4.
+
+### 7.4 Human console — RBAC, review queue, edit, history
+
+**CUJ-H1 — Owner bootstrap + RBAC management.** *Actor:* owner. *Trigger:* first boot, then
+ongoing. *Preconditions:* owner subjects set via env (§4.8). *Steps:* (1) on startup the app
+reconciles env-listed owners into `principals` (role=owner) — no chicken-and-egg; (2) owner
+logs in via OIDC; (3) at `/admin/rbac` assigns roles to other principals, and issues/revokes
+service **API keys** (only the hash is stored; the plaintext is shown once). *Outcome:* RBAC
+is administered in-DB with owners rooted outside the DB's own access surface. *Failure paths:*
+env owner not yet in IdP → still reconciled, logs in when IdP knows them; last-owner
+demotion guarded. *Ref:* §4.8, §4.9.
+
+**CUJ-H2 — Editor direct edit with advisory lint.** *Actor:* editor+. *Trigger:* editing a
+concept in the console. *Steps:* (1) edit + save → **direct commit** to `concepts` (ledger
+trigger records it, actor = the human principal via the txn GUC); (2) the **privacy screen
+still runs and can block** (CUJ-P2); (3) the **quality judge runs async as a linter** — it
+does *not* block; if it flags, a `review_queue(kind=flagged_human_edit)` row is created (→
+CUJ-H4, and fed to the dreamer). *Outcome:* fast, uninsulting human editing; human-introduced
+rot still gets caught before the dreamer amplifies it. *Failure paths:* privacy block →
+commit refused with inline reason. *Ref:* §4.3.
+
+**CUJ-H3 — Blast-radius escalation of a human mass edit.** *Actor:* editor+. *Trigger:* a bulk
+edit, or an edit to a load-bearing core concept. *Steps:* (1) detect scope (N-over-threshold
+rows, or `is_core`/high-inbound-link target); (2) route into the **blocking** quality path
+instead of advisory — the edit is held pending judge/human approval. *Outcome:* at agent-like
+scale, human edits get agent-like scrutiny. *Ref:* §4.3.
+
+**CUJ-H4 — Review/patrol queue triage.** *Actor:* admin+ (owner-defined owner_role). *Trigger:*
+items in `review_queue` (rejected proposals, flagged human edits). *Preconditions:* queue-depth
+alerting + triage SLA configured (§9) — the commitment that keeps it from becoming a graveyard.
+*Steps:* (1) at `/admin/review`, triage by priority lane; (2) per item: approve-as-is,
+edit-and-accept, or discard; (3) resolution recorded. *Outcome:* the escalation sink is
+actually drained; borderline/privacy-ambiguous cases get a human arbiter. *Failure paths:*
+queue depth breaches alert threshold → operators paged. *Ref:* §4.3.
+
+**CUJ-H5 — Version history time-travel + diff.** *Actor:* reader+. *Trigger:* viewing a
+concept's history. *Steps:* (1) `/admin/concepts/{path}/history` lists `concept_ledger`
+revisions by `recorded_at`; (2) selecting two revisions renders a git-like diff computed on
+read from the two full-text snapshots; (3) navigate by time. *Outcome:* full auditable history
+("what did it say, and who/why, as of date X"). *Ref:* §4.5.
+
+**CUJ-H6 — Browse the wiki as internal docs.** *Actor:* reader+ (human). *Trigger:* using the
+wiki as human-readable org documentation. *Steps:* (1) browse `/admin/concepts` via progressive
+disclosure — the generated per-directory index (from concept frontmatter) gives a navigable
+map; (2) follow cross-links (the concept graph); (3) search. *Outcome:* the same corpus agents
+use is legible to humans — the distillation (§4.15) is what keeps it readable rather than a
+pile of session transcripts. *Ref:* §4.7 (index), §4.15.
+
+### 7.5 Admin ops — import, export, sensitive deployment
+
+**CUJ-O1 — OKF import with git-style conflict diff.** *Actor:* admin/owner. *Trigger:* upload
+an OKF bundle. *Steps:* (1) `POST /v1/admin/import` (or console upload); (2) parse the bundle
+**leniently** (§4.7) — accept missing optional fields, unknown types/keys; **ignore
+producer-authored `index.md`/`log.md`**; (3) stage into `import_staged_concepts`, computing
+`collision` by `concept_path`; (4) console shows the collision set as **git-style diffs**;
+(5) admin resolves each: accept-incoming / keep-local / hand-merge; (6) applied resolutions go
+through the normal write path (ledger + provenance). *Outcome:* foreign knowledge merges
+without silently clobbering curated local knowledge. *Failure paths:* malformed bundle →
+`422` with which files failed; non-admin → `403`. *Ref:* §4.7.
+
+**CUJ-O2 — Summon-dreamer import consolidation.** *Actor:* admin/owner. *Trigger:* many
+conflicts, admin clicks "summon dreamer." *Steps:* (1) hand the diffed set to the dreamer;
+(2) it proposes a consolidated merge per conflict; (3) proposals surface back in the review UI
+for the admin's final accept/reject. *Outcome:* automation's leverage on bulk conflicts,
+human keeps final say. *Ref:* §4.7, §4.4.
+
+**CUJ-O3 — Export to OKF tarball.** *Actor:* admin/owner (or scheduled). *Trigger:*
+`GET /v1/admin/export`. *Steps:* (1) serialize each `concepts` row to a `path.md` with YAML
+frontmatter (typed fields + `frontmatter_extra`); (2) **regenerate a per-directory
+`index.md`** from concept titles/descriptions; (3) **fold `concept_ledger` into `log.md`**
+(ISO-8601 date headings, newest-first, `**Creation**`/`**Update**`/`**Deprecation**`
+prefixes); (4) stream a conformant tarball. *Outcome:* a vendor-neutral, re-importable OKF
+bundle; our ledger-derived `log.md` is the differentiator (reference bundles ship none).
+*Test:* round-trip export→import is identity-preserving on concept content. *Ref:* §4.7.
+
+**CUJ-O4 — Configure PII / TTL knobs.** *Actor:* owner. *Trigger:* PII-conscious deployment.
+*Steps:* (1) at `/admin/settings` set the raw-dump **max-TTL** (default: none/forever) and
+wire an org **PII scrubber** into the sanitization seam (§9); (2) `purge_expired_dumps`
+periodic task enforces the TTL. *Outcome:* org-tunable retention without a code change.
+*Failure/consequence to surface in UI:* a short TTL forfeits source-grounded re-derivation and
+re-tasks the dreamer to a research role (§4.4/§4.15) — the console warns on aggressive values.
+*Ref:* §4.15.
+
+**CUJ-O5 — Configure models against the AI gateway.** *Actor:* owner/operator. *Trigger:*
+production setup. *Steps:* (1) set per-agent model + the gateway base URL/credential in config
+(§4.10); (2) memory-edit, judge, and dreamer each resolve their own model; embedding model
+likewise. *Outcome:* the org's gateway owns routing/keys/cost/observability; we ship no
+production model opinions. *Failure paths:* gateway unreachable → pipeline jobs retry/backoff,
+hot path (save/recall/prime) unaffected. *Ref:* §4.10.
+
+**CUJ-O6 — Stand up a sensitive deployment and route to it.** *Actor:* operator + a team's
+agents. *Trigger:* sensitive/regulated knowledge that shouldn't pool in the org-wide instance.
+*Steps:* (1) deploy a **separate instance** (own DB, own IdP/RBAC, own tight TTL + PII
+scrubber) — one instance = one trust domain (§4.16); (2) program that team's agents to
+recognize sensitive content and route those `save`/`recall` calls to the sensitive instance's
+endpoint. *Outcome:* privacy scales by deploying another box, not by an in-app policy engine.
+*Ref:* §4.16, design-spec §6.
 
 ---
 
