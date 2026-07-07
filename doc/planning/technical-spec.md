@@ -214,9 +214,93 @@ auth/RBAC → `lib` (middleware) + `domain/rbac` (guards); the sanitization seam
 
 ## 4. Local development environment
 
-_uv + Python 3.13, docker-compose (Postgres+pgvector, Keycloak, optional local LLM server),
-owner bootstrap env vars, Makefile targets, the three model backends, embedding model, seed
-data. Step-by-step for Linux and macOS. (Pending — TS2.)_
+Goal: `make setup && make dev` brings the whole system up on a laptop (Linux or macOS) with no
+cloud dependencies. The repo already standardizes on **uv + Python 3.13 + ruff + mypy +
+pytest + pre-commit** (see `pyproject.toml`, `README.md`); this section extends that, it
+doesn't replace it.
+
+### 4.1 Prerequisites
+
+- **uv** (package/venv manager) and **Python 3.13** (`.python-version` pins it) — `uv python
+  install 3.13`.
+- **Docker + Docker Compose** for the backing services.
+- **A model backend** — one of the three dev options in §4.4. Nothing else is cloud-bound.
+
+### 4.2 Backing services (docker-compose)
+
+`compose.yaml` brings up the stateful dependencies (this is the dev harness — production is
+the org's own infra, design-spec §6):
+
+- **Postgres 16 + pgvector** — image with the `vector` and `pg_trgm` extensions (e.g.
+  `pgvector/pgvector:pg16`); the extension `CREATE`s run in the first migration (§5.5).
+- **Keycloak** — the default OIDC IdP, imported with a dev realm + a console client + a couple
+  of test users, so the admin console login works out of the box (design-spec §4.8). Swappable
+  for any OIDC issuer via config.
+- **(optional) a local LLM server** — profile-gated (`--profile local-llm`) so contributors on
+  the CLI/hosted backends don't pay for it (§4.4).
+
+The Litestar **web** process and the **procrastinate worker** run as *separate* processes
+(§3.3) — locally via `make dev` (two entrypoints, or a compose `app` + `worker` service pair);
+`make dev-app` / `make dev-worker` run them individually.
+
+### 4.3 Configuration & owner bootstrap
+
+Settings come from env (§9), read into a typed settings module (§3). A committed
+`.env.example` documents every var; `make setup` copies it to `.env`. Load-bearing ones:
+
+- `DATABASE_URL` (points at the compose Postgres).
+- `OKF_OWNER_SUBJECTS` — comma-separated OIDC subjects bootstrapped as **owners** at startup
+  (design-spec §4.8); the chicken-and-egg-free way in on a fresh box.
+- OIDC issuer URL + console client id/secret (Keycloak defaults for dev).
+- Per-agent model + embedding-model settings and the AI-gateway base URL/key (§4.4, §4.10).
+- Raw-dump `MAX_TTL` (default unset = forever) and the sanitizer/PII-scrubber selection
+  (§4.15).
+
+### 4.4 Model backends (dev only — production is the org's gateway, §4.10)
+
+Three interchangeable dev paths, chosen by config; **none is the production design**:
+
+1. **Local OpenAI-compatible server** — for a dev with a GPU or M-series Mac.
+   - *Linux (GPU):* Ollama (`ollama serve`) or vLLM; pull a generation model
+     (Qwen3.5-9B-class @ Q4 or Gemma 4 E4B) and an embedding model (BGE-M3, or
+     `nomic-embed-text` for CPU-only). Point `OPENAI_BASE_URL` at `http://localhost:11434/v1`
+     (Ollama) or the vLLM port.
+   - *macOS (Apple Silicon):* Ollama or **MLX-LM** for best throughput; same model choices.
+   - CrewAI/litellm treat this as a first-class OpenAI-compatible endpoint.
+2. **`claude -p`** (headless Claude Code) — for devs without the silicon; drive the agents via
+   an existing subscription. Wrapped as a custom LLM (litellm custom provider / CrewAI custom
+   LLM class).
+3. **`copilot -p`** (Copilot CLI programmatic mode) — same idea.
+
+> **Dev-data only.** The hosted CLIs (2, 3) *retain prompts* — never point them at real or
+> sensitive data (design-spec §4.10). They're for playing with the app on throwaway input.
+
+`make models-pull` fetches the local dev-baseline models; the docs pin exact versions once the
+memory-edit/judge prompts are validated against them (design-spec §8 residual).
+
+### 4.5 Makefile targets
+
+Standard targets (repo convention): `setup` (venv, deps via `uv sync --extra dev`, `.env`,
+pre-commit hooks), `dev` (compose up + app + worker), `dev-app`, `dev-worker`,
+`migrate` (alembic upgrade head — creates schema incl. triggers), `seed` (load dev fixtures:
+a small OKF sample bundle imported, a few `is_core` concepts, test principals/API keys),
+`models-pull`, `test`, `lint` (ruff), `format`, `typecheck` (mypy), `clean`, `help`. OS
+detection where paths differ (Linux vs macOS).
+
+### 4.6 First-run walkthrough
+
+```
+make setup                 # uv venv + deps + .env + pre-commit
+docker compose up -d db idp        # (+ --profile local-llm for a local model)
+make migrate               # schema + ledger trigger + pgvector/pg_trgm
+make seed                  # sample bundle, core concepts, a dev API key
+make dev                   # web (Litestar) + worker (procrastinate) up
+```
+
+Then: hit `GET /health`; log into `/admin` as a seeded owner (Keycloak dev user); `POST
+/v1/memories` with the dev API key and watch the worker derive → judge → a concept appear;
+`GET /v1/recall` and `GET /v1/prime`. This first-run path is exactly CUJ-A3 → CUJ-P1/P3 →
+CUJ-A2, so it's also the smoke test (§8).
 
 ---
 
