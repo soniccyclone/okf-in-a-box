@@ -839,9 +839,80 @@ endpoint. *Outcome:* privacy scales by deploying another box, not by an in-app p
 
 ## 8. Testing strategy and test plans
 
-_Integration-first, tied one-to-one to the CUJs (testcontainers Postgres, real/mocked LLM,
-deterministic agent testing, golden tests for OKF conformance + RRF + frontmatter + ledger
-diffs). Unit tests for pure logic. CI coverage per CUJ. (Pending — TS7.)_
+**Philosophy: integration-first.** The CUJs (§7) are the test backbone — each is written to
+double as an integration-test script, driven through the real HTTP/worker/DB stack against a
+**real Postgres**. Unit tests are reserved for pure functions with real logic. We test
+*behavior*, not implementation, so tests survive refactoring. This matches both the repo's
+existing pytest setup and the Litestar reference app's own split (mostly integration, few
+units).
+
+### 8.1 Test tiers
+
+- **Integration/routes** — drive the machine API and console through `litestar.testing`
+  (`AsyncTestClient` / `create_async_test_client`) against a real Postgres, overriding only the
+  model backend (§8.3). Covers CUJ-A*, CUJ-H*, CUJ-O*.
+- **Integration/services + worker** — exercise services and procrastinate job handlers
+  directly against the DB (distillation → proposal, judge apply, dreamer sweep, import merge).
+  Covers CUJ-P*.
+- **Unit** — pure logic only: RRF fusion, OKF (de)serialization + conformance, frontmatter
+  parse/emit, `index.md`/`log.md` generation, ledger-snapshot diffing, the sanitization seam,
+  RBAC ordering. Fast, no DB.
+
+### 8.2 Real Postgres (not mocks)
+
+Use **`pytest-databases`** (the maintained successor to hand-rolled testcontainers; the
+reference app's approach) to spin a real Postgres+pgvector container. Fixtures mirror the
+reference app: session-scoped `engine` (asyncpg, `NullPool`) + `create_all` once, an `app`
+fixture calling `create_app()` against it, and a per-test `TRUNCATE`-all cleanup for isolation.
+The ledger trigger, generated `tsvector`, and HNSW/GIN indexes are **exercised for real** —
+they're load-bearing behavior (§5.3/§5.4), so mocking the DB would test nothing that matters.
+
+### 8.3 Deterministic agent/LLM testing (the crux)
+
+LLM calls are non-deterministic and cost money, so the pipeline agents (memory-edit, judge,
+dreamer) must be testable without a live model. Strategy:
+
+- **A fake model provider** injected via DI (§3) that returns **scripted/recorded responses**
+  keyed by the call. Because everything routes through one model-provider seam (§4.10), tests
+  swap it wholesale — the memory-edit agent gets a canned distillation, the judge a canned
+  verdict.
+- **Test the plumbing deterministically, the prompts separately.** Integration tests assert
+  the *pipeline behavior* given a judge verdict (accept → concept + ledger row + provenance;
+  reject-quality → one repair then escalate; reject-privacy → no repair, review-queue row).
+  Prompt *quality* (does the real judge catch a real secret?) is a separate, smaller **eval
+  suite** run against a pinned local model, not part of the fast CI gate.
+- **Golden tests** for the deterministic transforms around the LLM: OKF round-trip
+  (export→import identity, CUJ-O3), frontmatter, RRF ranking, `log.md` folding, diff rendering.
+
+### 8.4 Test plan per CUJ (coverage matrix)
+
+Every CUJ maps to at least one integration test asserting its **outcome** and its **failure
+paths / invariants**. Load-bearing invariants to assert explicitly:
+
+| CUJ | Key assertions |
+|---|---|
+| A3 save | `202` fast; a `raw_dumps` row **and** a queued job exist in one txn; **no `concepts` row created synchronously** |
+| A1 prime / A2 recall | served from `concepts` only (no job enqueued); RRF order; empty-core/empty-result = `200 []`; recall degrades to FTS-only if embeddings down |
+| A4 CrewAI capture | verbatim `messages` captured (not `TaskOutput`); **CI test fails if the pinned CrewAI event schema drifts** (§3.3) |
+| P1→P3 pipeline | dump → proposal → (fake) verdict → concept + **ledger row** + **provenance edge** with citation |
+| P2 privacy | a planted secret is blocked for **both** an agent proposal and a human commit |
+| P4 repair bound | **at most one** repair retry; privacy rejects never repair |
+| P5 dreamer | no-op below dirtiness threshold; ≤200 edits/run; cooldown records skipped; budget breach halts mid-run |
+| P6 canary | injected reject-rate spike auto-halts; landed edits are reversible (ledger) |
+| H2/H3 human edit | direct commit + async advisory flag; mass/core edit escalates to blocking |
+| H4 review queue | rejected + flagged items enqueue; triage resolutions apply |
+| H5 history | N revisions → correct time-travel + diff |
+| O1/O3 import/export | lenient parse; producer `index.md`/`log.md` ignored on import; **export→import round-trip preserves concept content**; regenerated `index.md`/ledger-`log.md` present & conformant |
+| O4 TTL | `purge_expired_dumps` deletes only expired; forever-default keeps |
+| RBAC (H1) | owner/admin/editor/reader guard boundaries; API-key hash-only storage; revoked key rejected |
+
+### 8.5 CI
+
+Runs the existing gates (ruff, mypy, pytest — see `pyproject.toml`/§10) plus the
+pytest-databases Postgres service. The fast gate uses the fake model provider (no network, no
+GPU). The prompt-quality eval suite (§8.3) is a separate, opt-in job (needs a model), not on
+the PR critical path. Coverage tracked per CUJ, not by line percentage — a CUJ without a test
+is the real gap.
 
 ---
 
