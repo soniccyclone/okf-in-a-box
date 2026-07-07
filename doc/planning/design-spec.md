@@ -196,6 +196,15 @@ duplicates accrete. Someone has to garden. Doing it as scheduled proposals throu
 existing gate means the maintenance path reuses the trust machinery instead of inventing a
 privileged back door. The dreamer is just another proposer.
 
+**The dreamer's character depends on raw-source retention (§4.15).** With raw dumps
+retained, the dreamer can *re-derive* — reconcile a concept against the original source
+material that produced it. When an org sets an aggressive raw-source TTL, that material is
+gone, and the dreamer necessarily changes job: it becomes a **research/fact-checking agent**
+that can only validate the *current wiki prose* against external sources (e.g. web search),
+since it has nothing internal left to re-derive from. This is a real behavioral consequence
+of the retention knob, and orgs must tune the dreamer to match their TTL — see the warning
+in §4.15.
+
 ### 4.5 Versioning — current table plus a trigger-maintained full-text ledger
 
 **Decision.** Two tables per versioned entity:
@@ -321,30 +330,67 @@ both paths converge on the same principal-resolution logic. API keys are default
 specifically so the out-of-the-box experience doesn't require standing up IdP machine
 identity first; that's the whole in-a-box thesis applied to auth.
 
-### 4.10 LLM provider abstraction
+### 4.10 Model backends
+
+**Terminology first — there is no chat model here.** Nothing in this service is a human
+conversing with an LLM. Our agents (memory-edit, judge, dreamer) are **non-interactive**:
+they run from the queue or from cron and do instruction-following *generation*. The only
+"chat"-shaped thing is the API transport (the OpenAI chat-completions endpoint), not the
+product category. We need floors for **two** non-interactive models: a **generation model**
+the agents call, and an **embedding model** for hybrid retrieval (§4.14).
 
 **Decision.** A single **model-provider interface** with swappable backends:
 
-1. **Local OpenAI-compatible server** (Ollama / llama.cpp / vLLM) — the default for local
-   development. CrewAI runs on litellm, so any OpenAI-compatible endpoint is first-class;
-   we point it at `localhost`.
-2. **CLI shell-out adapters** — wrap the `claude` CLI (`-p`/headless) and/or the GitHub
-   Copilot CLI as a provider, so developers who lack the silicon for a decent local model
-   can drive the agents with a subscription they already pay for.
+1. **Local OpenAI-compatible server** (Ollama / llama.cpp / vLLM / MLX-LM on Mac) — the
+   **default**. CrewAI runs on litellm, so any OpenAI-compatible endpoint is first-class; we
+   point it at `localhost`. The embedding model runs the same way (local embeddings API).
+2. **CLI shell-out adapters** — wrap the `claude` CLI (`claude -p`, headless) and/or the
+   GitHub Copilot CLI (`copilot -p`, programmatic mode) as a generation provider, so a
+   developer without the silicon for a good local model can drive the agents with a
+   subscription they already pay for. **Local-dev convenience only — not a production
+   backend** (see the retention hazard below).
 
-Setup instructions for a local LLM server on **Linux and macOS** are a first-class
-deliverable (they belong in the technical spec / README, but the requirement is recorded
-here).
+**Model floors (validated baselines for the setup docs).**
 
-**Why.** Local-first keeps development free, private, and offline-capable, and proves the
-system doesn't depend on any single vendor's cloud (mirrors OKF's own vendor-neutrality).
-The CLI shell-out is a pragmatic on-ramp: not everyone has a 4090 or an M-series with
-enough unified memory, and asking developers to burn API credits to *try the thing* is a
-barrier. The constraint to note for the technical spec: the OpenAI-compatible path is
-trivial through litellm, but the **CLI shell-out needs a custom LLM wrapper** (a litellm
-custom provider or a CrewAI custom LLM class) that marshals prompts to the CLI and parses
-its output — that's real work, not a config flag, so it may land as a fast-follow rather
-than day one.
+- *Generation:* **Qwen3.5-9B-class at Q4** (~7GB, e.g. via Ollama) or **Gemma 4 E4B** —
+  both run on a 16GB M1-or-later Mac and any recent consumer GPU, and both do the reliable
+  **function-calling + structured output** our agents depend on (memory-edit emits
+  structured OKF; the judge emits verdicts). This is the floor; bigger is better if the box
+  allows.
+- *Embedding:* **BGE-M3** as the default (multilingual, and it produces dense *and* sparse
+  vectors — a natural fit for our hybrid retrieval), with **nomic-embed-text** (137M,
+  CPU-only, no GPU) as the runs-anywhere floor.
+
+Setup instructions for local generation + embedding servers on **Linux and macOS** are a
+first-class deliverable (they live in the technical spec / README; the requirement is
+recorded here).
+
+**Why local-first.** It keeps development free, private, and offline-capable, and proves the
+system depends on no single vendor's cloud (mirrors OKF's own vendor-neutrality). At a
+curated-wiki corpus size the model demands are modest, so the floor above is genuinely
+enough for all of this app's non-interactive work.
+
+**Why the CLI shell-out is dev-only — the retention hazard.** Both hosted CLIs *retain the
+prompts you send them* (GitHub retains Copilot CLI prompts per its terms; Anthropic's terms
+govern `claude`). Backing derivation with a hosted CLI therefore ships our **raw dumps and
+derivation prompts — the exact PII-laden content §4.15 exists to contain — out of the org**,
+where the vendor retains them. That is fine for playing with the app on non-sensitive data;
+it is disqualifying for real org memory. Local models keep the data in-house, which is the
+whole point.
+
+**ToS reality (checked July 2026, and volatile).** Shelling out to the real `claude -p`
+binary is currently compliant *because it is Claude Code itself* — Anthropic's Feb 2026 ToS
+restricts using the subscription **OAuth token in third-party tools**, not invoking the CLI,
+and the June 15 plan to meter `claude -p` off subscriptions was cancelled, so headless
+Claude still draws from Pro/Max/Team as before. Copilot's `copilot -p` is explicitly
+documented for automation. But Anthropic changed this policy **three times in six months**,
+so we treat CLI shell-out as a convenience escape hatch, never a load-bearing dependency —
+the local path is the real default.
+
+**Implementation constraint.** The OpenAI-compatible path is trivial through litellm; the
+**CLI shell-out needs a custom LLM wrapper** (a litellm custom provider or a CrewAI custom
+LLM class) that marshals prompts to the CLI and parses its output — real work, not a config
+flag, so it may land as a fast-follow rather than day one.
 
 ### 4.11 Web stack — Litestar + htmx, server-rendered
 
@@ -468,6 +514,16 @@ layers, not one.
 sets a **max-TTL** on all raw sources via config and a scheduled purge sweep (reusing the
 queue/cron infra) enforces it. Default = no expiry.
 
+> **Warning — a short TTL changes what your dreamer *is*.** Purging raw sources destroys the
+> ability to re-derive a concept from its original material (§4.2), and it re-tasks the
+> dreamer (§4.4). An org that kills every raw source in, say, one week no longer has a
+> dreamer that reconciles concepts against their sources — it has a **research agent** that
+> can only confirm the current wiki prose against *external* sources like web search,
+> because nothing internal survives to re-derive from. That may be perfectly acceptable, but
+> it is a deliberate posture: **if you set an aggressive TTL, you must tune the dreamer to
+> match it.** Do not set a short TTL and expect source-grounded re-derivation to keep
+> working — the two are mutually exclusive.
+
 **Access asymmetry.** Concepts are org-readable; **raw dumps are not** — they hold the
 sensitive originals. Provenance stays auditable by owner/admin, but the recall API never
 exposes raw dumps, and raw dumps are candidates for encryption at rest.
@@ -529,12 +585,27 @@ The recall side is what makes us a *memory*, not just an audit sink: agents that
 us later read from us (or each other's contributions) to avoid re-deriving what the swarm
 already learned.
 
-We will provide guidance (and likely a thin client / drop-in CrewAI tools — one to save
-context, one to recall) for wiring both directions up, so a crew can be told, in effect,
-"check the memory service before you start, and send your context to it before you finish."
-The exact shape of those helpers is technical-spec material; the design commitment here is
-that **both directions are cheap for the caller** — recall is one synchronous query, save
-is one fire-and-forget POST.
+We will provide guidance (and likely a thin client / drop-in CrewAI tools) for wiring both
+directions up, so a crew can be told, in effect, "check the memory service before you start,
+and send your context to it before you finish." The exact shape of those helpers is
+technical-spec material; the design commitment here is that **both directions are cheap for
+the caller** — recall is one synchronous query, save is one fire-and-forget POST.
+
+**Interop guidance — a plain `@tool` is not enough for save.** The two directions want
+*different* integration seams, and this is a point our docs must make loudly:
+
+- **Recall is a tool.** A CrewAI `@tool` the agent invokes when it decides it needs context
+  is exactly right — recall is a normal, agent-driven read.
+- **Save is a lifecycle hook, not a tool.** If saving is a tool the agent "decides" to call,
+  we get two failure modes: the agent forgets to call it, and when it does call it, it
+  passes a *self-authored summary* — which defeats the entire raw-source-of-truth premise
+  (§4.2), because we wanted the verbatim context, not the agent's lossy précis of it. The
+  correct seam is a **framework lifecycle callback** (CrewAI task/step callback) that ships
+  the agent's actual prompt context automatically on task completion, regardless of whether
+  the agent chose to. Our guidance for integrating an external agentic system will therefore
+  center on wiring a **step/task callback** for save, and expose a recall `@tool`
+  separately. Documenting only a save `@tool` would quietly corrupt the corpus with
+  summaries-of-summaries.
 
 ---
 
@@ -596,14 +667,19 @@ box, not by growing a policy engine.
 5. **`index.md` / `log.md` generation fidelity** — how faithfully do we reproduce OKF §6/§7
    structure on export, and do we ingest producer-authored `index.md`/`log.md` on import or
    regenerate ours? (Technical-spec detail, flagged here so it isn't forgotten.)
-6. **Local model floor** — which local model(s) do we validate the agents against, so
-   "works on my machine" has a defined baseline for the setup docs? This now also fixes the
-   **embedding model** floor (§4.14), since recall quality and re-embed cost both hinge on it.
-7. **Distillation vs. provenance tension under TTL** — if an org sets a short max-TTL on raw
-   dumps (§4.15), re-derivation from originals (§4.2) is no longer possible after purge. Do
-   we snapshot a scrubbed derivation-input alongside the concept so re-derivation survives
-   purge, or accept that short-TTL deployments forfeit re-derivation? Leaning "forfeit, and
-   say so."
+6. ~~**Local model floor**~~ **RESOLVED (§4.10).** Generation floor: Qwen3.5-9B-class @ Q4
+   or Gemma 4 E4B (16GB M1+/recent GPU, function-calling + structured output). Embedding
+   floor: BGE-M3 default, nomic-embed-text as the CPU-only floor. No chat model exists — the
+   agents are non-interactive generation. Remaining nuance: pin exact model versions once we
+   test the memory-edit/judge prompts against them.
+7. **Distillation vs. provenance tension under TTL** — settled in principle (§4.15): a short
+   TTL forfeits source-grounded re-derivation, and orgs must re-tune the dreamer to a
+   research/fact-check role (§4.4). Remaining fork: do we *optionally* snapshot a scrubbed
+   derivation-input beside the concept so re-derivation survives purge, or leave that out?
+   Leaning "leave it out; document the trade-off loudly" (now done).
+8. **External-system integration surface** — confirm the save-via-lifecycle-callback vs.
+   recall-via-`@tool` split (§5) survives contact with real CrewAI (and non-CrewAI) callers,
+   and decide how much of a thin client we ship vs. document.
 
 ---
 
