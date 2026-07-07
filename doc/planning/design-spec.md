@@ -21,9 +21,11 @@ nobody wants to be locked into a vendor's catalog to store it.**
 So what we are actually building is a **governed, self-maintaining knowledge base** with
 three faces:
 
-1. **A machine ingestion hot path** — other agents fire memories at us and get out of the
-   way fast. We sit on their critical path, so we must be quick to acknowledge and durable
-   before we are clever.
+1. **A machine read/write hot path** — other agents both *write* memories to us (fire a
+   raw dump and get out of the way) and *read* memories back from us (recall relevant
+   knowledge to ground their own work). We sit on their critical path, so writes must be
+   quick to acknowledge and durable before they are clever, and reads must be fast and
+   synchronous. This is a full **Memories API**, not a one-way ingest funnel.
 2. **A human oversight plane** — an admin console where people with the right role can see
    what the agents wrote, how it changed over time, and correct the record.
 3. **A portability boundary** — the whole corpus imports from and exports to a
@@ -79,8 +81,11 @@ tree is a *serialization*, not our source of truth. Our source of truth is the d
 
 ```mermaid
 flowchart TD
-    Agents([Other agents]) -->|raw dump| API[Ingest API]
+    Agents([Other agents]) ==>|raw dump| API[Memories API]
     API -.->|202 fast| Agents
+    Agents -->|recall query| API
+    API -->|read| C
+    C -.->|concepts| API
     API ==>|write + enqueue<br/>one txn| Q[(PG queue)]
     Cron([Cron]) --> Dream[Dreamer]
     Q --> ME[Memory-edit agent]
@@ -93,10 +98,13 @@ flowchart TD
     C <-->|import / export| B[OKF bundle]
 ```
 
-Three planes, one database. The web tier acknowledges fast and hands off; the workers do
-the slow LLM work off the hot path; the judge is the choke point every *autonomous* write
-passes through; Postgres is simultaneously the durability boundary, the job queue, the
-version store, and the graph store.
+Three planes, one database. Note the **read/write asymmetry** at the Memories API: *writes*
+take the slow governed path (durable capture → queue → agent → judge → concepts), while
+*reads* go straight from the current-state concepts table and return synchronously — no
+queue, no judge, no LLM. The web tier acknowledges writes fast and hands off; the workers
+do the slow LLM work off the hot path; the judge is the choke point every *autonomous*
+write passes through; Postgres is simultaneously the durability boundary, the job queue,
+the version store, and the graph store.
 
 ---
 
@@ -350,31 +358,54 @@ duplication for the sake of a JavaScript framework. The console is fundamentally
 diff-review + queues — exactly what hypermedia does well. This is the anti-brain-rot choice:
 the complexity stays in the domain, not in a client bundle.
 
-### 4.12 Async processing model, restated
+### 4.12 The read/write asymmetry, restated
 
-Ingest endpoints do the minimum: validate auth, write the raw dump, enqueue the derivation
-job, return `202`. Everything expensive — the memory-edit agent, the judge, the dreamer's
-sweeps — runs in worker processes pulling from the Postgres queue. Workers scale
-independently of the web tier. Because our SLOs are dominated by LLM latency in the callers'
-own pipelines, we optimize the *acknowledgement* path hard and let the *derivation* path
-take the time it needs.
+The Memories API has two hot-path shapes and they are optimized differently.
+
+**Writes are async.** Ingest endpoints do the minimum: validate auth, write the raw dump,
+enqueue the derivation job, return `202`. Everything expensive — the memory-edit agent, the
+judge, the dreamer's sweeps — runs in worker processes pulling from the Postgres queue.
+Workers scale independently of the web tier.
+
+**Reads are synchronous.** Recall endpoints serve directly from the current-state
+`concepts` table (and its indexes) — no queue, no judge, no LLM in the loop. A calling agent
+asking "what do we know about X" gets an answer in one round trip. Reads never mutate and
+never propose, so they skip the entire governance path. This is why the concepts table is
+tuned for fast filtered/lookup/search reads while the raw dumps and ledger are tuned for
+durable append.
+
+Because our SLOs are dominated by LLM latency in the callers' own pipelines, we optimize the
+*write-acknowledgement* path and the *read* path hard, and let the *derivation* path take
+the time it needs.
 
 ---
 
-## 5. The producer contract — how calling agents talk to us
+## 5. The caller contract — how agentic systems talk to us
 
-A calling system (typically a CrewAI crew, but the contract is framework-agnostic) treats
-us the way a human treats an llm-wiki: "here is what I learned, remember it." Concretely,
-before or as a crew completes a unit of work, it POSTs its **prompt context / relevant
-conversation slice** to our ingest endpoint as a raw dump, authenticated by API key. It
-gets an immediate `202`; it does **not** wait for a wiki concept to be produced. We handle
-derivation and judging asynchronously.
+A calling system (typically a CrewAI crew, but the contract is framework-agnostic) uses us
+in two directions, the way a human uses an llm-wiki.
 
-We will provide guidance (and likely a thin client / a drop-in CrewAI callback or tool) for
-wiring this up, so that a crew can be told, in effect, "send your context to the memory
-service before you finish." The exact shape of that helper is technical-spec material; the
-design commitment here is that **the producer's job is trivial and non-blocking** — dump
-raw material, move on. All the intelligence is on our side of the boundary.
+**Writing ("remember this").** Before or as a crew completes a unit of work, it POSTs its
+**prompt context / relevant conversation slice** to our write endpoint as a raw dump,
+authenticated by API key. It gets an immediate `202`; it does **not** wait for a wiki
+concept to be produced. We handle derivation and judging asynchronously. The caller's job
+here is trivial and non-blocking — dump raw material, move on. All the intelligence is on
+our side of the boundary.
+
+**Reading ("what do we already know?").** Before or during its work, a crew queries our
+read endpoints to pull relevant memories into its own context — by concept path, by
+type/tag, or by search over the corpus — and grounds its reasoning on what the wiki already
+holds. This is synchronous and fast (§4.12); the caller gets concepts back in the response.
+The recall side is what makes us a *memory*, not just an audit sink: agents that write to
+us later read from us (or each other's contributions) to avoid re-deriving what the swarm
+already learned.
+
+We will provide guidance (and likely a thin client / drop-in CrewAI tools — one to save
+context, one to recall) for wiring both directions up, so a crew can be told, in effect,
+"check the memory service before you start, and send your context to it before you finish."
+The exact shape of those helpers is technical-spec material; the design commitment here is
+that **both directions are cheap for the caller** — recall is one synchronous query, save
+is one fire-and-forget POST.
 
 ---
 
