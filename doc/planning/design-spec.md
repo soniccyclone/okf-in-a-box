@@ -147,6 +147,18 @@ stages.
    produces a *proposed* OKF concept (a new concept or an edit to an existing one). That
    proposal goes to the judge (§4.3). If accepted, it lands in the `concepts` table.
 
+**Provenance is many-to-one, and re-derivation supersedes-current / appends-ledger.** A
+concept is *not* one-dump-one-concept — it accretes: many raw dumps contribute to one
+concept over time (a topic sharpened by many contributions), tracked in a first-class
+provenance edge table (§4.6). When we re-derive a concept (a better prompt, newer source
+material), the "supersede vs. append" question dissolves once you separate the log from the
+projection: re-derivation is a normal `UPDATE` to the current-state `concepts` row
+(**supersede**) while the ledger trigger writes the prior body to the append-only ledger
+(**append**) — you do both. Superseded provenance edges are **soft-invalidated** (marked
+with an `invalid_at` + reason), never deleted, so "why did the concept ever say X" survives.
+The memory-edit agent is required to **cite which dump(s) justified which claims** (the
+Generative Agents "insight (because of …)" move) — the antidote to unexplainable fusion.
+
 **Why.** The raw dump is the source of truth; the wiki concept is a *lossy, opinionated
 derivation* of it. Separating them means (a) we acknowledge fast, before any LLM runs, (b)
 if the memory-edit agent or its prompt improves later, we can **re-derive** from the
@@ -159,29 +171,59 @@ raw dump that spawned it.
 **Rejected.** Deriving synchronously on the request (puts an LLM on the hot path);
 throwing away the raw input after derivation (destroys re-derivation and provenance).
 
-### 4.3 The judge-gated autonomous-write invariant
+### 4.3 The tiered judge gate
 
-**Decision.** **Every write to the wiki that originates from an autonomous agent passes
-through the LLM-as-judge.** The memory-edit agent and the dreamer both emit *proposals*,
-never direct writes. The judge accepts, rejects (with a recorded verdict), or defers a
-proposal against quality criteria and the state of related concepts.
+**Decision.** The judge is **two concerns, gated differently by author and risk** — the
+Wikipedia autopatrolled / pending-changes model applied to agent memory. All autonomous
+writes are *proposals* (the memory-edit agent and dreamer never write directly); human
+console edits are direct commits. The ledger trigger (§4.5) records every write regardless.
 
-Human edits made through the admin console by `editor` and above are **direct writes** —
-they do not pass the judge. Humans are trusted committers; the ledger trigger (§4.5)
-records their change either way.
+- **A privacy/PII/secret screen blocks *everyone*** — autonomous agents *and* human editors.
+  A leaked credential is catastrophic and author-independent, and it is objectively
+  checkable (deterministic-ish, low false-positive, low latency), so blocking humans here
+  costs almost nothing.
+- **A quality/consistency judge blocks *agents*** but only **advisory-lints *humans*.**
+  Agent proposals must pass to commit; human edits by `editor`+ commit immediately, and the
+  judge runs async as a *linter* that flags questionable human edits into the review/patrol
+  queue (which the dreamer consumes as prioritized work, §4.4). The judge is a *reviewer* of
+  human edits, not a *gatekeeper* — which humans accept where they resent being blocked.
+- **Blast-radius escalation:** a human *mass* edit, or an edit to a load-bearing core
+  concept, escalates from advisory into the blocking quality path — at that scale a human
+  edit has agent-like propagation risk.
 
-**Why.** The judge exists to guard the *untrusted, high-volume, unattended* path. That is
-the autonomous agents — they hallucinate, they duplicate, they drift. A human deliberately
-editing in the console is the opposite: low-volume, accountable, already gated by RBAC.
-Routing human edits through an LLM would add latency and cost to the one path that doesn't
-need policing, and would be insulting to the operator. Framing the invariant as "the judge
-gates *autonomous* writes" (not "all writes") keeps the choke point exactly where the risk
-is.
+**Judge rejection handling (reason-routed).** "Rejected" is not one bucket; the reason drives
+the response:
 
-> **Flagged for Nathan to attack:** this is a real position, not a foregone conclusion.
-> The alternative is "judge gates *everything* including human edits" for a uniform
-> write-path. I think that's wrong for the reasons above, but it's the kind of invariant
-> that's painful to change later, so let's decide it deliberately.
+- **Always persist the rejection** (concept, verdict, reason class, rationale) even when the
+  end state is discard. Reject-rate by reason is dashboarded as the memory-edit-agent
+  regression alarm — silent discard would violate "fail fast, not silent."
+- **Quality/format rejection → exactly one bounded repair retry**, feeding the judge's
+  *specific* structured critique back to the memory-edit agent (a bare "low quality" verdict
+  makes retry pure waste). Bound = 1 (2 total judge passes), enforced by a stored
+  attempt-count; raised only if the "rescued-on-retry" metric justifies it.
+- **Privacy rejection → never a free-form LLM rewrite** (that risks relocating the secret
+  into a new field): deterministic redaction + one re-judge, or straight to human review.
+- **Escalation sink = an owned human review queue** in the admin console (repair-exhausted or
+  privacy-ambiguous cases). This is being built day one, which commits us to a named owner
+  role, queue-depth alerting, and a triage SLA — without them a review queue rots into a
+  "graveyard."
+
+**Why.** The judge's value is highest exactly where accountability is lowest and volume is
+highest — autonomous dumps. Every mature system earned "gate the untrusted, advisory-patrol
+the trusted" through real scars: hard-gating trusted humans produces insult, workarounds,
+and false-positive friction that drives away your best curators, while buying little (a named
+human is already accountable in a way an agent is not). The one place to gate humans hard is
+privacy, because a leaked secret is author-independent and objectively checkable. And bounded
+*external-feedback* repair works (the judge is the external signal; intrinsic self-correction
+degrades outputs — Huang et al. ICLR'24) while unbounded loops are documented token bonfires,
+hence the hard bound of 1.
+
+**Prior art.** Wikipedia [Pending Changes](https://en.wikipedia.org/wiki/Wikipedia:Pending_changes)
+/ [autopatrolled](https://en.wikipedia.org/wiki/Wikipedia:Patrolled_revisions);
+InnerSource [Trusted Committer](https://patterns.innersourcecommons.org/p/trusted-committer);
+[Reflexion](https://arxiv.org/pdf/2303.11366) (bounded retry); the AWS SQS
+[dead-letter-queue](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+"graveyard" antipattern (a queue nobody drains).
 
 ### 4.4 The dreamer — scheduled self-maintenance
 
@@ -195,6 +237,41 @@ import-conflict diff (§4.7).
 duplicates accrete. Someone has to garden. Doing it as scheduled proposals through the
 existing gate means the maintenance path reuses the trust machinery instead of inventing a
 privileged back door. The dreamer is just another proposer.
+
+**Guardrails — three independent kill switches (design assumption: any one guard eventually
+fails, so none is load-bearing alone).** No serious consolidation loop runs on a plain
+wall-clock timer with unbounded scope; the expensive/dangerous operations are *reading the
+whole corpus* (cost) and *writing across it* (corruption), so we bound both plus make the
+worst case recoverable. Defaults for a 10⁴–10⁵ corpus, all operator-tunable:
+
+1. **Dirtiness-gated cadence.** Nightly off-peak cron *as an upper bound*, but the run is a
+   **no-op unless accumulated staleness/flag/duplicate pressure crosses a threshold** —
+   Generative Agents fires reflection on summed-importance, not the clock, so spend tracks
+   real work. Bursts of upstream change coalesce/debounce into one batched sweep.
+2. **Hard scope cap + per-record cooldown.** Cap **~200 proposed edits per run**
+   (deliberately <1% of the corpus, so a bad run is a canary not a catastrophe) and a
+   **7-day per-record cooldown** (a recently-edited concept is ineligible — the hard
+   guarantee against thrash and the forcing function for convergence). Sampled/ringed, never
+   exhaustive.
+3. **Gateway cost circuit-breaker.** Hard **per-run and per-day token/dollar budget** at the
+   AI gateway (§4.10) that kills a run mid-flight on breach. Two-tier routing: a cheap model
+   scans/triages (reading 10⁵ records is the costly part), the expensive model only drafts
+   proposals and judges.
+
+Plus two non-negotiables the dreamer shares with the rest of the system: **invalidate-not-
+delete** (every edit reversible via the ledger + soft-invalidated provenance, §4.5/§4.6 —
+a bad sweep is undoable) and **deterministic freshness** (timestamps/versions decide recency,
+*never* the LLM — LLMs resolve the same recency conflict differently across runs). The judge
+that gates the dreamer's proposals is a **different model+prompt** than the dreamer, and its
+**reject-rate is a canary metric** — a mid-run spike means the proposer prompt has gone bad,
+so the run auto-halts. The dreamer also **consumes the human-edit advisory-flag patrol
+queue** (§4.3) as prioritized work.
+
+*Prior art:* [Generative Agents](https://arxiv.org/abs/2304.03442) (event-driven reflection),
+[mem0](https://mem0.ai/blog/long-term-memory-ai-agents) (bounded per-op blast radius),
+[Zep/Graphiti](https://arxiv.org/abs/2501.13956) (invalidate-not-delete),
+[LangMem ReflectionExecutor](https://langchain-ai.github.io/langmem/guides/delayed_processing/)
+(debounce).
 
 **The dreamer's character depends on raw-source retention (§4.15).** With raw dumps
 retained, the dreamer can *re-derive* — reconcile a concept against the original source
@@ -243,7 +320,8 @@ nails them down):
 - `raw_dumps` — immutable source-of-truth inputs. `(id, payload, producer_principal, received_at, …)`
 - `concepts` — current state. `(concept_path PK, type, title, description, resource, tags[], okf_timestamp, body_md, frontmatter_extra JSONB, …)`. The recommended OKF fields get real typed columns (they're queryable); everything else a producer sends lives in `frontmatter_extra` JSONB so we honor OKF's "any additional keys" rule losslessly.
 - `concept_ledger` — append-only full-text history (§4.5).
-- `concept_links` — the graph edge table, parsed out of body markdown links plus explicit provenance edges to `raw_dumps`. Lets us answer "what links here / what is orphaned / what did the dreamer break" as SQL.
+- `concept_links` — the graph edge table, parsed out of body markdown links. Lets us answer "what links here / what is orphaned / what did the dreamer break" as SQL.
+- `concept_provenance` — the many-to-one source edges: `(concept_path, raw_dump_id, contribution_role, valid_at, invalid_at, reason)`. Dump references *accrete* (§4.2); superseded ones are soft-invalidated (`invalid_at` + reason), never deleted — the Wikidata "one claim, many references, deprecate-not-delete" shape. This is what lets a human trace any claim to the verbatim dump(s) that justified it.
 - `edit_proposals` + `judge_verdicts` — the audit trail of the gate (§4.3): what was proposed, by which agent, from which raw dump, what the judge decided and why.
 - RBAC tables — `principals` (human and service), `roles`, `api_keys` (§4.8, §4.9).
 - import staging tables (§4.7).
@@ -270,6 +348,20 @@ and garden.
   accept incoming, keep local, or hand-merge. Additionally, a **"summon the dreamer"
   button** hands the diffed view to the dreamer agent to propose a consolidated merge,
   which the admin then reviews.
+- **Reserved files (`index.md` / `log.md`): regenerate on export, ignore on import.** On
+  export we emit a full per-directory `index.md` (a free projection of concept frontmatter —
+  matching what all three reference bundles do) and a `log.md` generated from our ledger.
+  The `log.md` is where we're *differentiated*: the reference repo ships **zero** log.md
+  files because almost no producer can emit an honest change history — but our append-only
+  ledger *is* exactly that, folded to ISO-8601 date headings (the one `MUST` in OKF §7),
+  newest-first, with `**Creation**`/`**Update**`/`**Deprecation**` prefixes. On import we
+  **ignore** producer-authored `index.md`/`log.md` for building state and regenerate our own:
+  `index.md` is 100% derivable (ingesting it invites drift), and `log.md` is unstructured
+  prose with no reliable schema (OKF §7: "Log entries are prose"), so structured ingestion is
+  unreliable by construction. Per OKF §9 a consumer must not reject on missing/odd reserved
+  files anyway. *(Deferred follow-up: an imported `log.md` is the only carrier of pre-custody
+  history — if that ever matters, store it verbatim as an opaque provenance artifact keyed to
+  its directory, never parsed into our authoritative ledger.)*
 
 **Why.** Import mutates the whole corpus and can silently clobber curated local knowledge
 with stale or foreign data — that is an owner/admin blast radius, not an editor one.
@@ -520,6 +612,28 @@ queue/cron infra) enforces it. Default = no expiry.
 > match it.** Do not set a short TTL and expect source-grounded re-derivation to keep
 > working — the two are mutually exclusive.
 
+**v1 keeps this simple; a three-tier retention model is the v2 target.** For v1 the above is
+the whole story: raw dumps forever-by-default with a max-TTL knob, and short-TTL deployments
+simply forfeit re-derivation. The reason we don't try to be cleverer *yet* is a legal reframe
+worth stating so v2 is shaped correctly: under GDPR there is no "scrub it and keep it forever"
+option. A snapshot detailed enough to re-derive a good concept is, by construction, still
+**pseudonymised personal data** (residual quasi-identifiers + sub-100% detection recall
+guarantee it — Recital 26; WP29 05/2014), so it carries the *same* storage-limitation and
+erasure obligations as the raw dump — scrubbing *moves* the liability, it doesn't delete it.
+Scrubbing hard enough to reach true *anonymisation* strips the detail re-derivation needs, and
+usually can't even be certified. So the correct v2 answer is **three tiers, three clocks,
+nothing mislabelled**: (1) raw dump — short TTL, **purge = crypto-erasure** (destroy a
+per-record key rather than chase every backup replica; once the key is gone the ciphertext
+trends non-personal); (2) a **pseudonymised derivation-input snapshot** on its own *medium*
+TTL, explicitly treated as personal data and wired into the same erasure path (built with
+consistent pseudonymisation, e.g. Presidio's `InstanceCounterAnonymizer`, and *no* mapping
+vault by default — it's a re-identification bomb); (3) the durable concept. Setting
+snapshot-TTL=0 degrades cleanly to "forfeit re-derivation." This is deferred to v2 because it
+is real engineering (per-record key management, a second TTL clock, erasure fan-out), and the
+v1 forfeit-or-keep-forever posture is honest in the meantime. *(Verify EDPB 01/2025
+pseudonymisation guidelines' final-adoption status and the CJEU* EDPS v SRB *C-413/23 P
+operative paragraphs before the crypto-shred legal argument goes load-bearing.)*
+
 **Access asymmetry.** Concepts are org-readable; **raw dumps are not** — they hold the
 sensitive originals. Provenance stays auditable by owner/admin, but the recall API never
 exposes raw dumps, and raw dumps are candidates for encryption at rest.
@@ -581,27 +695,40 @@ The recall side is what makes us a *memory*, not just an audit sink: agents that
 us later read from us (or each other's contributions) to avoid re-deriving what the swarm
 already learned.
 
-We will provide guidance (and likely a thin client / drop-in CrewAI tools) for wiring both
-directions up, so a crew can be told, in effect, "check the memory service before you start,
-and send your context to it before you finish." The exact shape of those helpers is
-technical-spec material; the design commitment here is that **both directions are cheap for
-the caller** — recall is one synchronous query, save is one fire-and-forget POST.
+**We ship four integration surfaces day one**, each assigned to what it is actually good at.
+Distillation always stays **server-side** (mirroring mem0's `infer=True`): callers ship raw
+verbatim context, we extract — which keeps the client dumb and the "source of truth"
+genuinely verbatim.
 
-**Interop guidance — a plain `@tool` is not enough for save.** The two directions want
-*different* integration seams, and this is a point our docs must make loudly:
+1. **A documented, stable HTTP contract** (`/recall`, `/save`) — the bedrock, so we're never
+   a bottleneck and any language can integrate.
+2. **A thin client library** (Python first) over that contract — retries, auth, batching. How
+   every peer (mem0/Zep/LangMem) actually distributes.
+3. **A bundled CrewAI auto-capture SAVE helper**, hooked to the event bus's
+   **`LLMCallCompletedEvent` / `TaskCompletedEvent`** — one-liner `OKFMemory(...).attach(crew)`.
+4. **An MCP server for RECALL** — universal agent-invoked read across any MCP client.
 
-- **Recall is a tool.** A CrewAI `@tool` the agent invokes when it decides it needs context
-  is exactly right — recall is a normal, agent-driven read.
-- **Save is a lifecycle hook, not a tool.** If saving is a tool the agent "decides" to call,
-  we get two failure modes: the agent forgets to call it, and when it does call it, it
-  passes a *self-authored summary* — which defeats the entire raw-source-of-truth premise
-  (§4.2), because we wanted the verbatim context, not the agent's lossy précis of it. The
-  correct seam is a **framework lifecycle callback** (CrewAI task/step callback) that ships
-  the agent's actual prompt context automatically on task completion, regardless of whether
-  the agent chose to. Our guidance for integrating an external agentic system will therefore
-  center on wiring a **step/task callback** for save, and expose a recall `@tool`
-  separately. Documenting only a save `@tool` would quietly corrupt the corpus with
-  summaries-of-summaries.
+**Interop guidance — a plain `@tool` is not enough for save; and MCP structurally can't do
+verbatim save.** The two directions want *different* seams, and this is a point our docs must
+make loudly:
+
+- **Recall is a tool** (or an MCP tool). Agent-invoked read, exactly what tools/MCP are for.
+- **Save is a lifecycle callback, not a tool.** If saving is a tool the agent "decides" to
+  call, two failure modes bite: the agent forgets, and when it does call it, it passes a
+  *self-authored summary* — defeating the raw-source-of-truth premise (§4.2). The correct
+  seam is a **framework lifecycle callback**. Critically, in CrewAI that means the **event
+  bus** (`LLMCallCompletedEvent`, whose `messages` field carries the *verbatim* prompt +
+  system instructions + accumulated context) — **not** the `task_callback` constructor arg or
+  `after_kickoff`, which hand you only the *distilled* `TaskOutput`/`CrewOutput`. Save over
+  MCP is structurally impossible to do verbatim (the host decides when tools fire → the agent
+  can forget; tool inputs are model-authored → you get a self-summary; the server never sees
+  the system prompt), so MCP-save is offered at most as a documented, lossy manual escape
+  hatch for non-CrewAI callers.
+
+**Biggest risk to flag:** CrewAI's event API is young and churns (there's a known
+`LLMCallStartedEvent.messages` multimodal validation bug), so the auto-capture helper needs
+**version pinning + a CI test against each CrewAI release**, or it silently stops capturing —
+treat the `messages` schema as an explicit version boundary.
 
 ---
 
@@ -642,7 +769,8 @@ box, not by growing a policy engine.
   only.
 - **No baked-in PII policy.** We ship the mechanism — sanitization seam + max-TTL knob +
   access asymmetry (§4.15) — not a policy. Default is XSS-safe, forever-retention, no PII
-  redaction.
+  redaction. The three-tier crypto-shred + pseudonymised-snapshot retention model is a **v2
+  target**, not v1 (§4.15); v1 short-TTL deployments forfeit re-derivation.
 - **No custom locking / eventual-consistency machinery** — Postgres transactions are the
   concurrency model. (§4.5)
 - **No production model opinions.** Production model choice is the org's, configured
@@ -652,35 +780,44 @@ box, not by growing a policy engine.
 
 ---
 
-## 8. Open questions still to resolve (before or during the technical spec)
+## 8. Open questions
 
-1. **Judge scope** (§4.3) — confirm the "autonomous writes only, humans bypass" invariant.
-   This is the one I most want challenged.
-2. **Provenance cardinality** — can one concept derive from *many* raw dumps over time
-   (accretion), and does re-derivation supersede or append? Affects `concept_links` and the
-   ledger semantics.
-3. **Judge rejection handling** — on reject, do we discard, park for human review, or feed
-   back to the memory-edit agent for a bounded retry loop? Leaning "park + surface in
-   console."
-4. **Dreamer cadence & scope controls** — how do owners bound what the dreamer may touch and
-   how often, so it can't run up a large LLM bill or mass-rewrite the corpus unattended?
-5. **`index.md` / `log.md` generation fidelity** — how faithfully do we reproduce OKF §6/§7
-   structure on export, and do we ingest producer-authored `index.md`/`log.md` on import or
-   regenerate ours? (Technical-spec detail, flagged here so it isn't forgotten.)
-6. ~~**Local model floor**~~ **RESOLVED (§4.10).** Production model choice is the org's,
-   configured per-agent against their AI gateway — we ship no production model opinions. The
-   Qwen3.5-9B / Gemma-4-E4B / BGE-M3 / nomic figures are only **local-dev baselines** for the
-   laptop escape hatches, not a production floor. No chat model exists — the agents are
-   non-interactive generation. Remaining nuance: pin the dev-baseline model versions once we
-   test the memory-edit/judge prompts against them.
-7. **Distillation vs. provenance tension under TTL** — settled in principle (§4.15): a short
-   TTL forfeits source-grounded re-derivation, and orgs must re-tune the dreamer to a
-   research/fact-check role (§4.4). Remaining fork: do we *optionally* snapshot a scrubbed
-   derivation-input beside the concept so re-derivation survives purge, or leave that out?
-   Leaning "leave it out; document the trade-off loudly" (now done).
-8. **External-system integration surface** — confirm the save-via-lifecycle-callback vs.
-   recall-via-`@tool` split (§5) survives contact with real CrewAI (and non-CrewAI) callers,
-   and decide how much of a thin client we ship vs. document.
+The original eight are **resolved** — decisions folded into the sections above; the research
+that informed them is in [`open-questions-findings.md`](./open-questions-findings.md).
+
+1. ~~Judge scope~~ **RESOLVED (§4.3):** tiered gate — universal privacy screen blocks
+   everyone; quality judge blocks agents, advisory-lints humans; blast-radius escalation.
+2. ~~Provenance cardinality~~ **RESOLVED (§4.2/§4.6):** many-dumps→one-concept via a
+   provenance edge table; re-derivation supersedes-current/appends-ledger; soft-invalidate;
+   mandatory citation.
+3. ~~Judge rejection handling~~ **RESOLVED (§4.3):** reason-routed — log always; one bounded
+   repair retry (quality only); deterministic-or-human for privacy; owned review queue built
+   day one.
+4. ~~Dreamer cadence & scope~~ **RESOLVED (§4.4):** dirtiness-gated cadence, ~200 edits/run,
+   7-day cooldown, gateway cost breaker, invalidate-not-delete, deterministic freshness.
+5. ~~`index.md`/`log.md` fidelity~~ **RESOLVED (§4.7):** regenerate both on export (ledger-
+   derived `log.md` is our differentiator), ignore both on import.
+6. ~~Local model floor~~ **RESOLVED (§4.10):** production is per-agent config against the
+   org's AI gateway; the Qwen/Gemma/BGE-M3/nomic figures are local-dev baselines only.
+7. ~~PII snapshot under TTL~~ **RESOLVED (§4.15):** v1 = raw forever/TTL-knob, short-TTL
+   forfeits re-derivation; three-tier crypto-shred + pseudonymised snapshot is the v2 target
+   (a useful scrubbed snapshot is still personal data, so it can't be "kept forever").
+8. ~~Integration surface~~ **RESOLVED (§5):** four surfaces day one — HTTP contract, thin
+   client, CrewAI event-bus SAVE helper, MCP recall.
+
+**Residual follow-ups carried into the technical spec (smaller, mechanical):**
+
+- Pin dev-baseline model + embedding-model versions once the memory-edit/judge prompts are
+  tested against them (§4.10).
+- CrewAI event-bus API is young/churning — version-pin + CI test the auto-capture helper
+  against each release; model the `messages` schema as an explicit version boundary (§5).
+- Deferred: store an imported `log.md` verbatim as an opaque per-directory provenance artifact
+  *if* pre-custody history ever matters (§4.7).
+- Before the v2 crypto-shred/pseudonymisation work goes load-bearing, re-read the primary
+  legal sources (EDPB 01/2025 pseudonymisation guidelines final-adoption status; CJEU
+  *EDPS v SRB* C-413/23 P operative paragraphs) (§4.15).
+- Define the review-queue owner role, queue-depth alerting, and triage SLA that the day-one
+  review queue commits us to (§4.3).
 
 ---
 
@@ -691,7 +828,13 @@ box, not by growing a policy engine.
 - **Raw dump** — the verbatim, immutable input an agent sends us; the source of truth from
   which concepts are derived.
 - **Memory-edit agent** — the worker agent that turns a raw dump into a proposed concept.
-- **Judge** — the LLM-as-judge that gates every autonomous write.
+- **Judge** — the LLM-as-judge: a universal privacy screen (blocks everyone) plus a quality
+  gate that blocks agents and advisory-lints humans (§4.3).
+- **Review/patrol queue** — the owned admin-console queue where repair-exhausted or
+  privacy-ambiguous rejections, and advisory-flagged human edits, land for human triage; also
+  fed to the dreamer as prioritized work.
+- **Provenance edge** — a soft-invalidatable link from a concept to a raw dump that
+  contributed to it; accretes many-to-one and records the "why" behind a claim (§4.6).
 - **Dreamer** — the scheduled maintenance agent that proposes edits to keep the wiki fresh
   and coherent, and assists import-conflict consolidation.
 - **Ledger** — the append-only, full-text, trigger-maintained version history of concepts.
