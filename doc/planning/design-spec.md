@@ -673,6 +673,53 @@ only people who can get it right — the deploying team.
 for every org, unbounded policy surface, security footguns); a hierarchical namespace (tags
 are a richer, flatter graph — consistent with OKF's own link-graph model).
 
+### 4.17 Priming — the hot core
+
+**Decision.** A **third read access pattern**, distinct from recall (§4.14) and index
+navigation (§4.7): a small, **size-bounded, tag-scoped set of always-load concepts**, marked
+`core` on the same `concepts` table, served by a cheap synchronous **`prime` endpoint**. A
+calling agent fetches it once at startup and pins it in its context. It is **maintained by
+the dreamer** (kept small, fresh, high-signal) under a hard size budget, and seeded by humans.
+
+**Why — the core is what makes retrieval possible at all.** Recall answers *"I have a
+question"*; the index answers *"what is the shape of what exists."* But an agent starting cold
+has neither a question nor a reason to form one — it does not know the wiki *contains*
+anything worth asking about. Retrieval is then chicken-and-egg: you only find what you already
+knew to look for. **The hot core breaks that loop** — it orients the agent to what the org
+knows, what conventions bind it, and, crucially, *that more memory exists and how to ask for
+it*. It is also the right home for foundational knowledge too load-bearing to depend on
+retrieval luck — invariants, conventions, "never do X" — the material that must be present
+*regardless* of query, and which lexical/semantic mismatch (§4.14) would otherwise silently
+drop. Priming is the answer to "what does an agent load when it has no query yet."
+
+**Mechanism.**
+- **A `core` marker on the `concepts` table** (a frontmatter flag / reserved tag) — *no new
+  storage tier*. Postgres is still the whole box; the hot core is a flagged selection over the
+  concepts we already have, not a separate store or cache.
+- **`prime(tags=[…])`** — a cheap synchronous read returning the hot-core concepts, optionally
+  scoped. The caller pins the result. It is **advisory**: we do not own the caller's context
+  window, so what actually stays resident is their choice (§5). We curate and serve; they pin.
+- **Tag-scoped (§4.16).** A *single* global core is too coarse at org scale — a payments
+  copilot and a frontend copilot need different always-know sets — so the core is a small
+  global core plus per-domain cores selected by tag.
+- **Hard size budget — boundedness *is* what makes it hot.** A core that grows unbounded stops
+  being a core (MemGPT's core-memory blocks are fixed-size for exactly this reason). The
+  dreamer enforces the budget with the same gardening machinery and edit cap as §4.4:
+  prune/merge/demote to keep the core small and high-signal. Demotion is not deletion — a
+  concept dropped from the core still lives in the corpus, reachable by recall.
+
+**Why advisory + server-side curation.** We are a memory *service*, not the agent runtime, so
+what lives in the caller's context is the caller's call; and the curation intelligence (what
+*deserves* to be core) stays on our side, mirroring the server-side-distillation split of §5.
+
+**Rejected.** Making the index the primer (too large to load at org scale, and it is a *map*,
+not *content* — §4.7); a single global core (too coarse — domains differ); a separate
+hot-storage or in-memory cache tier (unneeded — the concepts table is RAM-resident at our
+scale and reads fan out to replicas, §4.13; the hot core is a *semantic* always-load layer,
+not a performance optimization); an unbounded core (stops being hot). *Prior art:*
+MemGPT/Letta **core memory** (fixed-size, always-in-context blocks vs. retrieved archival
+memory); the llm-wiki root/README-you-always-read.
+
 ---
 
 ## 5. The caller contract — how agentic systems talk to us
@@ -687,13 +734,15 @@ concept to be produced. We handle derivation and judging asynchronously. The cal
 here is trivial and non-blocking — dump raw material, move on. All the intelligence is on
 our side of the boundary.
 
-**Reading ("what do we already know?").** Before or during its work, a crew queries our
-read endpoints to pull relevant memories into its own context — by concept path, by
-type/tag, or by search over the corpus — and grounds its reasoning on what the wiki already
-holds. This is synchronous and fast (§4.12); the caller gets concepts back in the response.
-The recall side is what makes us a *memory*, not just an audit sink: agents that write to
-us later read from us (or each other's contributions) to avoid re-deriving what the swarm
-already learned.
+**Reading has two moments — prime at startup, recall per-query.** *At startup* a crew calls
+**`prime`** (§4.17) to pin the small, tag-scoped hot core in its context — the orientation
+that tells it what the org knows and that more memory exists to ask for. *Then, during its
+work*, it queries **`recall`** to pull query-relevant memories — by concept path, by type/tag,
+or by hybrid search — grounding its reasoning on what the wiki already holds. Both are
+synchronous and fast (§4.12); the caller gets concepts back in the response. The read side is
+what makes us a *memory*, not just an audit sink: agents that write to us later read from us
+(or each other's contributions) to avoid re-deriving what the swarm already learned — and
+without the prime step they might never know to look.
 
 **We ship four integration surfaces day one**, each assigned to what it is actually good at.
 Distillation always stays **server-side** (mirroring mem0's `infer=True`): callers ship raw
@@ -818,6 +867,9 @@ that informed them is in [`open-questions-findings.md`](./open-questions-finding
   *EDPS v SRB* C-413/23 P operative paragraphs) (§4.15).
 - Define the review-queue owner role, queue-depth alerting, and triage SLA that the day-one
   review queue commits us to (§4.3).
+- Hot core (§4.17): set the default size budget, and decide the seeding story for a
+  cold-start wiki (an empty corpus has no core — who/what establishes the initial global +
+  per-domain cores, and how `core` promotion/demotion is decided by humans vs. the dreamer).
 
 ---
 
@@ -847,6 +899,10 @@ that informed them is in [`open-questions-findings.md`](./open-questions-finding
   insertion point for an org's PII/secret scrubber.
 - **Hybrid retrieval** — recall combining Postgres FTS (lexical) and `pgvector` (semantic),
   fused with Reciprocal Rank Fusion; all inside Postgres.
+- **Hot core** — a small, size-bounded, tag-scoped set of always-load concepts (marked `core`
+  on the concepts table) that a caller pins at startup; the priming layer (§4.17).
+- **Priming** — the startup `prime` call that pins the hot core, orienting an agent so it
+  knows what exists and that more memory is available to recall.
 - **Sensitive deployment** — a separate, dedicated instance of this service run by a team to
   hold sensitive/regulated knowledge under their own trust domain, rather than isolating it
   via in-app RBAC.
