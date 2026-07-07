@@ -280,9 +280,95 @@ and dreamer schedules are procrastinate periodic tasks, not migrations.
 
 ## 6. API and endpoint contracts
 
-_The machine API (raw-dump write → 202, recall, prime), admin console routes (htmx),
-import/export, auth (API key + OIDC). Request/response shapes, status codes, error envelope,
-limits, OpenAPI. (Pending — TS4.)_
+Three surface groups: the **machine API** (JSON, for calling agents — the hot path), the
+**admin console** (htmx-rendered HTML, for humans), and **import/export** (admin ops). Auth
+and the read/write asymmetry from design-spec §4.12 govern all three. OpenAPI is generated for
+the machine API (Litestar built-in, §3); the console routes are not part of the public
+contract.
+
+### 6.1 Conventions
+
+- **Versioning:** machine API under `/v1`. Console under `/admin`.
+- **Auth (§4.9):** `Authorization: Bearer <token>` on every machine call. The auth middleware
+  (§3) tries two extractors — API key (`okf_sk_…`, hashed lookup) then OIDC JWT (validate
+  against the configured issuer) — and resolves both to one `principal` + role. Console uses
+  the OIDC browser flow (§4.8). `401` no/invalid credential, `403` role too low.
+- **Error envelope:** consistent JSON `{ "error": { "code", "message", "detail"? } }` with
+  the appropriate 4xx/5xx. Litestar exception handlers map domain errors to this shape.
+- **Size/rate limits:** raw-dump payload capped (configurable, default e.g. 256 KiB) → `413`
+  over cap; per-principal rate limit → `429`. Limits are lax (design-spec: LLM latency
+  dominates) but present to bound abuse.
+- **Idempotency:** `save` accepts an optional `Idempotency-Key` so a retrying caller doesn't
+  double-insert a raw dump.
+
+### 6.2 Machine API — write (async)
+
+**`POST /v1/memories`** — the hot-path save (§4.2, CUJ-A3). Body:
+`{ "payload": "<verbatim context>", "tags": ["…"], "meta": { "crew_id"?, "task_id"? } }`.
+
+- Middleware authenticates → resolves service principal + role (needs ≥ writer-equivalent).
+- Payload runs the **sanitization seam** (§9) synchronously (XSS + any org PII scrubber).
+- Insert `raw_dumps` row **and** enqueue `derive_concept(raw_dump_id)` **in one transaction**
+  (§4.1), then return **`202 Accepted`** with `{ "raw_dump_id", "status": "queued" }`.
+- The caller does **not** wait for a concept. No concept is created on this path synchronously.
+- Failure paths: `413` oversize, `429` rate, `422` malformed, `401/403` auth. The endpoint
+  never blocks on the LLM.
+
+### 6.3 Machine API — read (synchronous)
+
+**`GET /v1/prime?tags=…&budget=…`** — the hot-core primer (§4.17, CUJ-A1). Returns the small,
+size-bounded, tag-scoped set of `is_core` concepts (global + requested domains), newest/most-
+central first, within an optional token/count `budget`. Cheap indexed read (partial index on
+`is_core`), synchronous. Response: `{ "core": [ {concept_path, title, body_md, tags}… ],
+"budget_used" }`. This is advisory — the caller decides what to pin.
+
+**`GET /v1/recall?q=…&tags=…&type=…&k=…`** — hybrid retrieval (§4.14, CUJ-A2). Runs FTS +
+vector, fuses with RRF, returns top-`k` concepts with scores:
+`{ "results": [ {concept_path, title, description, body_md, tags, score}… ] }`. Also
+`GET /v1/concepts/{path}` for a direct fetch by identity, and
+`GET /v1/concepts/{path}/history` for the ledger view (used by console CUJ-H5; gated by role).
+All reads serve from `concepts`/`concept_ledger` only — no queue, no judge, no LLM; replica-
+routable (§4.13).
+
+### 6.4 Machine API — MCP recall
+
+An **MCP server exposes `recall` (and `prime`) as tools** (§5 design-spec, CUJ-A5) for any MCP
+client. **Save is not offered over MCP as a first-class tool** (structurally can't capture
+verbatim context — design-spec §5); at most a documented, lossy manual `save` tool for
+non-CrewAI callers, clearly labelled. The MCP server is a thin adapter over the same service
+layer as the HTTP recall.
+
+### 6.5 Admin console (htmx)
+
+Server-rendered HTML under `/admin`, OIDC-authenticated, role-gated by guard (§3). Route
+groups map to console CUJs (§7.4):
+
+- `/admin` dashboard — reject-rate, queue depth, dreamer activity (§9 observability).
+- `/admin/concepts` — browse/search (progressive disclosure via generated index, CUJ-H6),
+  view, and for `editor`+ **edit** (direct commit; advisory lint runs async, CUJ-H2/H3).
+- `/admin/concepts/{path}/history` — time-travel + diff view (CUJ-H5).
+- `/admin/review` — the review/patrol queue triage (CUJ-H4); `admin`+.
+- `/admin/rbac` — principals, roles, API-key issue/revoke (CUJ-H1); `admin`+ (owner for owner
+  changes).
+- `/admin/import` — upload bundle → conflict diff review + summon-dreamer (CUJ-O1/O2); `admin`+.
+- `/admin/settings` — TTL/PII knobs, model/gateway config (CUJ-O4/O5); `owner`.
+
+htmx partials return HTML fragments for in-place updates (diff panes, queue actions); no SPA.
+
+### 6.6 Import / export
+
+- **`POST /v1/admin/import`** (or the console upload) — accepts an OKF bundle (tarball/dir),
+  parses leniently (§4.7), stages into `import_batches`/`import_staged_concepts`, returns the
+  collision set for review. Owner/admin only. Resolution endpoints apply
+  accept-incoming/keep-local/merged per staged concept; a "summon dreamer" action enqueues a
+  consolidation proposal (CUJ-O2).
+- **`GET /v1/admin/export`** — streams a conformant OKF tarball: concept files from
+  `concepts`, regenerated per-directory `index.md`, and `log.md` folded from `concept_ledger`
+  (§4.7, CUJ-O3). Always available; owner/admin.
+
+### 6.7 Health & ops
+
+`GET /health` (liveness), `GET /ready` (DB + queue reachable). Metrics endpoint per §9.
 
 ---
 
