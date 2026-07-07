@@ -330,67 +330,63 @@ both paths converge on the same principal-resolution logic. API keys are default
 specifically so the out-of-the-box experience doesn't require standing up IdP machine
 identity first; that's the whole in-a-box thesis applied to auth.
 
-### 4.10 Model backends
+### 4.10 Model configuration — per-agent, against the org's AI gateway
 
 **Terminology first — there is no chat model here.** Nothing in this service is a human
 conversing with an LLM. Our agents (memory-edit, judge, dreamer) are **non-interactive**:
 they run from the queue or from cron and do instruction-following *generation*. The only
 "chat"-shaped thing is the API transport (the OpenAI chat-completions endpoint), not the
-product category. We need floors for **two** non-interactive models: a **generation model**
-the agents call, and an **embedding model** for hybrid retrieval (§4.14).
+product category. Two kinds of model are in play — a **generation model** the agents call,
+and an **embedding model** for hybrid retrieval (§4.14) — and neither is interactive.
 
-**Decision.** A single **model-provider interface** with swappable backends:
+**Production decision.** Each agent and the embedding model are **independently
+configurable**, and the org connects CrewAI to **their own AI gateway** in the standard
+litellm/CrewAI way (base URL + credentials + a model name per agent). We do **not** build a
+bespoke provider layer or ship opinions about which vendor to use — we expose the standard
+CrewAI `LLM` configuration surface and let the org point each agent at their gateway. So:
 
-1. **Local OpenAI-compatible server** (Ollama / llama.cpp / vLLM / MLX-LM on Mac) — the
-   **default**. CrewAI runs on litellm, so any OpenAI-compatible endpoint is first-class; we
-   point it at `localhost`. The embedding model runs the same way (local embeddings API).
-2. **CLI shell-out adapters** — wrap the `claude` CLI (`claude -p`, headless) and/or the
-   GitHub Copilot CLI (`copilot -p`, programmatic mode) as a generation provider, so a
-   developer without the silicon for a good local model can drive the agents with a
-   subscription they already pay for. **Local-dev convenience only — not a production
-   backend** (see the retention hazard below).
+- The **memory-edit agent**, the **judge**, and the **dreamer** each get their own model
+  setting. They have genuinely different cost/quality profiles — high-volume derivation
+  wants something cheap and fast; the judge may warrant a stronger reasoner — and per-agent
+  config lets the org spend accordingly.
+- The **embedding model** is likewise a config setting pointed at the gateway (or wherever
+  the org serves embeddings).
+- The org's gateway (litellm proxy, Portkey, Cloudflare/Kong AI Gateway, a cloud provider's
+  gateway, whatever they run) owns provider routing, API keys, rate limits, cost controls,
+  fallback, and observability.
 
-**Model floors (validated baselines for the setup docs).**
+**Why.** Model choice, spend, data-handling, and provider routing are org decisions that
+change per-deployment and over time, and the AI-gateway pattern is exactly where
+organizations already centralize them. Reinventing that plane inside this service would be
+brain-rot — we'd be building a worse version of the thing they already run. Per-agent
+assignment matters because the judge and the memory-edit agent are not interchangeable
+workloads. Our job is to expose clean, standard configuration, not to have opinions about
+the org's model strategy.
 
-- *Generation:* **Qwen3.5-9B-class at Q4** (~7GB, e.g. via Ollama) or **Gemma 4 E4B** —
-  both run on a 16GB M1-or-later Mac and any recent consumer GPU, and both do the reliable
-  **function-calling + structured output** our agents depend on (memory-edit emits
-  structured OKF; the judge emits verdicts). This is the floor; bigger is better if the box
-  allows.
-- *Embedding:* **BGE-M3** as the default (multilingual, and it produces dense *and* sparse
-  vectors — a natural fit for our hybrid retrieval), with **nomic-embed-text** (137M,
-  CPU-only, no GPU) as the runs-anywhere floor.
+**Local development (escape hatches — instructions, not architecture).** So a developer can
+run and test the app *without* wiring up the org's gateway or spending on frontier APIs, we
+document three purely-local paths. None of these is the production design; they exist so the
+app is playable on a laptop.
 
-Setup instructions for local generation + embedding servers on **Linux and macOS** are a
-first-class deliverable (they live in the technical spec / README; the requirement is
-recorded here).
+1. **A local OpenAI-compatible server** (Ollama / llama.cpp / vLLM / MLX-LM on Mac), for a
+   dev with a decent GPU or an M-series Mac. Dev-baseline models that run acceptably on such
+   hardware and still do the **function-calling + structured output** the agents need:
+   generation — **Qwen3.5-9B-class @ Q4** (~7GB) or **Gemma 4 E4B**; embedding — **BGE-M3**,
+   or **nomic-embed-text** (137M, CPU-only) when there's no GPU at all.
+2. **`claude -p`** (headless Claude Code) and 3. **`copilot -p`** (Copilot CLI programmatic
+   mode), for devs who lack the silicon and would rather drive the agents with a
+   subscription they already pay for.
 
-**Why local-first.** It keeps development free, private, and offline-capable, and proves the
-system depends on no single vendor's cloud (mirrors OKF's own vendor-neutrality). At a
-curated-wiki corpus size the model demands are modest, so the floor above is genuinely
-enough for all of this app's non-interactive work.
+Setup instructions for these on **Linux and macOS** are a first-class doc deliverable.
 
-**Why the CLI shell-out is dev-only — the retention hazard.** Both hosted CLIs *retain the
-prompts you send them* (GitHub retains Copilot CLI prompts per its terms; Anthropic's terms
-govern `claude`). Backing derivation with a hosted CLI therefore ships our **raw dumps and
-derivation prompts — the exact PII-laden content §4.15 exists to contain — out of the org**,
-where the vendor retains them. That is fine for playing with the app on non-sensitive data;
-it is disqualifying for real org memory. Local models keep the data in-house, which is the
-whole point.
-
-**ToS reality (checked July 2026, and volatile).** Shelling out to the real `claude -p`
-binary is currently compliant *because it is Claude Code itself* — Anthropic's Feb 2026 ToS
-restricts using the subscription **OAuth token in third-party tools**, not invoking the CLI,
-and the June 15 plan to meter `claude -p` off subscriptions was cancelled, so headless
-Claude still draws from Pro/Max/Team as before. Copilot's `copilot -p` is explicitly
-documented for automation. But Anthropic changed this policy **three times in six months**,
-so we treat CLI shell-out as a convenience escape hatch, never a load-bearing dependency —
-the local path is the real default.
-
-**Implementation constraint.** The OpenAI-compatible path is trivial through litellm; the
-**CLI shell-out needs a custom LLM wrapper** (a litellm custom provider or a CrewAI custom
-LLM class) that marshals prompts to the CLI and parses its output — real work, not a config
-flag, so it may land as a fast-follow rather than day one.
+> **Hazard — never point the dev escape hatches at real data.** The hosted CLIs *retain the
+> prompts you send them* (GitHub retains Copilot CLI prompts per its terms; Anthropic's
+> terms govern `claude`). They are for playing with the app on throwaway data only. Real org
+> memory runs through the org's chosen gateway under the org's own data-handling terms
+> (§4.15). *(ToS note, checked July 2026 and volatile: shelling the real `claude -p` binary
+> is currently compliant because it is Claude Code itself — the Feb 2026 ToS restricts the
+> OAuth token in third-party tools, not invoking the CLI — but Anthropic changed this policy
+> three times in six months, which is exactly why it stays a dev convenience.)*
 
 ### 4.11 Web stack — Litestar + htmx, server-rendered
 
@@ -613,10 +609,12 @@ the caller** — recall is one synchronous query, save is one fire-and-forget PO
 
 One `docker compose up` brings up: Postgres, Keycloak (default IdP), the Litestar app, the
 worker(s), and optionally a local LLM server. Owners are set via environment variables.
-Swapping the IdP is configuration (OIDC issuer URL + client), and swapping the LLM backend
-is configuration (provider + endpoint). A generic corporate deployment should be able to
-adopt the service without reading our source — point it at their IdP, point it at their
-model, set the owners, go.
+Swapping the IdP is configuration (OIDC issuer URL + client). Models are configuration too:
+the org points CrewAI at **their own AI gateway** and assigns a model per agent (§4.10) — we
+ship no model opinions for production. A generic corporate deployment should be able to adopt
+the service without reading our source — point it at their IdP, point it at their AI gateway,
+set the owners, go. (Local model servers and the `claude -p`/`copilot -p` hatches are
+dev-only conveniences, not part of a production deployment.)
 
 **Read replicas for scale.** The primary handles governed writes; recall traffic fans out to
 Postgres read replicas (§4.13). This is the horizontal scaling knob for an org-wide
@@ -647,8 +645,10 @@ box, not by growing a policy engine.
   redaction.
 - **No custom locking / eventual-consistency machinery** — Postgres transactions are the
   concurrency model. (§4.5)
-- **CLI shell-out LLM adapters may be a fast-follow**, not day-one, given the custom-wrapper
-  cost. (§4.10)
+- **No production model opinions.** Production model choice is the org's, configured
+  per-agent against their AI gateway (§4.10). Local model servers and the `claude -p` /
+  `copilot -p` hatches are **dev-only**; the CLI wrappers may be a fast-follow given their
+  custom-wrapper cost.
 
 ---
 
@@ -667,10 +667,11 @@ box, not by growing a policy engine.
 5. **`index.md` / `log.md` generation fidelity** — how faithfully do we reproduce OKF §6/§7
    structure on export, and do we ingest producer-authored `index.md`/`log.md` on import or
    regenerate ours? (Technical-spec detail, flagged here so it isn't forgotten.)
-6. ~~**Local model floor**~~ **RESOLVED (§4.10).** Generation floor: Qwen3.5-9B-class @ Q4
-   or Gemma 4 E4B (16GB M1+/recent GPU, function-calling + structured output). Embedding
-   floor: BGE-M3 default, nomic-embed-text as the CPU-only floor. No chat model exists — the
-   agents are non-interactive generation. Remaining nuance: pin exact model versions once we
+6. ~~**Local model floor**~~ **RESOLVED (§4.10).** Production model choice is the org's,
+   configured per-agent against their AI gateway — we ship no production model opinions. The
+   Qwen3.5-9B / Gemma-4-E4B / BGE-M3 / nomic figures are only **local-dev baselines** for the
+   laptop escape hatches, not a production floor. No chat model exists — the agents are
+   non-interactive generation. Remaining nuance: pin the dev-baseline model versions once we
    test the memory-edit/judge prompts against them.
 7. **Distillation vs. provenance tension under TTL** — settled in principle (§4.15): a short
    TTL forfeits source-grounded re-derivation, and orgs must re-tune the dreamer to a
