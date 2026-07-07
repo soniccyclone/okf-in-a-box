@@ -985,5 +985,56 @@ so an org can wire its own backend. Metrics via a `/metrics` endpoint.
 
 ## 10. Build, tooling, and CI/CD
 
-_uv/ruff/mypy/pytest gates, pre-commit, Makefile standard targets, container build, migration
-runs, CI matrix — reconciled with the existing repo template. (Pending — TS9.)_
+The repo starts from the Nearform Python template (uv, ruff, mypy, pytest, pre-commit,
+conventional commits, GitHub Actions). This section keeps those conventions and layers on what
+the service needs.
+
+### 10.1 Packaging & dependencies
+
+- **`pyproject.toml` updates:** rename from the template placeholder (`hub-template-python`) to
+  `okf-in-a-box`; keep Python `>=3.13`. Add runtime deps: `litestar`, `advanced-alchemy`
+  (pinned — faster-moving than Litestar, §3), `sqlalchemy[asyncio]`, `asyncpg`, `alembic`,
+  `pgvector`, `procrastinate`, `crewai`, `litellm`, `msgspec`, `pydantic-settings` (or the
+  reference app's own settings), `python-jose`/OIDC lib, `nh3` (HTML sanitizer), an MCP server
+  lib, `structlog`. Dev extras already present (pytest/mypy/ruff/pre-commit) gain
+  `pytest-databases`, `pytest-asyncio`, `anyio`.
+- Keep the existing **ruff** rule set (`E,W,F,I,N,UP,B,C4,SIM,S`) and **mypy** strict flags
+  from `pyproject.toml` — they're good; don't loosen them. `tests/*` keeps the `S101` ignore.
+
+### 10.2 Local gates & pre-commit
+
+Unchanged from the template: pre-commit runs ruff (check), ruff-format (check), mypy, pytest,
+and conventional-commit validation on staged files. `make lint/format/typecheck/test` mirror
+them. Migrations get their own check: a CI/pre-push step asserting `alembic upgrade head` +
+autogenerate produces **no pending diff** (model/migration drift guard).
+
+### 10.3 Containers & processes
+
+- **Two runtime entrypoints from one image:** the Litestar **web** process and the
+  **procrastinate worker** process (§3.3) — different commands, same image. `compose.yaml`
+  wires `app` + `worker` + `db` + `idp` (+ optional `local-llm`).
+- **Migrations run as an explicit step** (`make migrate` / an init container), not implicitly
+  at app boot, so schema changes (incl. the ledger trigger + extension creation) are
+  deliberate and auditable.
+
+### 10.4 CI matrix
+
+GitHub Actions (extends the template's `ci.yml`):
+
+1. **Lint/type** — ruff + mypy (fast, no services).
+2. **Test** — pytest with a **pytest-databases Postgres+pgvector** service; the fast gate uses
+   the **fake model provider** (§8.3), so no GPU/network/model needed. This is the PR-blocking
+   gate.
+3. **Migration drift** — `alembic upgrade head` on a clean DB + autogenerate-is-empty check.
+4. **(opt-in, non-blocking) prompt-eval** — the §8.3 eval suite against a pinned local model;
+   scheduled/manual, not on the PR critical path (needs a model, and prompt quality shouldn't
+   gate a code change).
+5. Dependabot auto-merge (template) stays for dep bumps after checks pass.
+
+### 10.5 Release
+
+The template's manual PyPI release workflow is **not** the right model for a deployable service
+— OKF-in-a-box ships as a **container image**, not a PyPI package. Replace the publish workflow
+with an image build+push (tagged by version/commit) on release, and keep the design-spec's
+"one `docker compose up`" promise (§6 design-spec) as the deployment contract. Versioning stays
+via `bumpversion` as configured.
