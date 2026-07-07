@@ -95,10 +95,186 @@ data. Step-by-step for Linux and macOS. (Pending — TS2.)_
 
 ## 5. Data model, migrations, and triggers
 
-_Concrete schema for every table (raw_dumps, concepts + core/tags, concept_ledger,
-concept_links, concept_provenance, edit_proposals, judge_verdicts, review_queue,
-principals/roles/api_keys, import staging, procrastinate queue), the ledger trigger, pgvector
-HNSW + FTS/GIN indexes, and migration tooling. (Pending — TS3.)_
+Implements design-spec §4.5 (ledger), §4.6 (relational mapping), §4.14 (retrieval indexes),
+§4.15 (retention/access), §4.16 (tags), §4.17 (hot core). One Postgres database; extensions
+`vector` (pgvector) and `pg_trgm`. Column lists are the v1 shape — illustrative but concrete
+enough to build and migrate against; DTOs (§3) decouple these from the wire format.
+
+### 5.1 Entity overview
+
+```mermaid
+erDiagram
+    raw_dumps ||--o{ concept_provenance : "sources"
+    concepts ||--o{ concept_provenance : "cites"
+    concepts ||--o{ concept_ledger : "trigger-writes"
+    concepts ||--o{ concept_links : "from"
+    concepts ||--o{ edit_proposals : "target"
+    edit_proposals ||--|| judge_verdicts : "verdict"
+    edit_proposals ||--o{ review_queue : "escalates"
+    principals ||--o{ api_keys : "holds"
+    principals ||--o{ raw_dumps : "produced"
+    roles ||--o{ principals : "assigned"
+```
+
+Two axes to keep straight: the **write/governance side** (`raw_dumps` → `edit_proposals` →
+`judge_verdicts` → `concepts`, with `review_queue` as the escalation sink) and the
+**history/provenance side** (`concept_ledger` full-text versions + `concept_provenance`
+source edges). Reads serve from `concepts` only.
+
+### 5.2 Tables
+
+**`raw_dumps`** — immutable source-of-truth inputs (design-spec §4.2). Never updated.
+
+| column | type | notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `producer_principal_id` | `uuid` FK→principals | who sent it |
+| `payload` | `text` | verbatim, post-sanitization-seam (§9); candidate for encryption at rest (§4.15) |
+| `content_meta` | `jsonb` | source hints (crew/task id, tags requested) |
+| `received_at` | `timestamptz` | |
+| `expires_at` | `timestamptz` NULL | NULL = keep forever (default); set by max-TTL knob; purge sweep deletes where `now() > expires_at` |
+
+**`concepts`** — current state; the *only* table reads touch. Identity = OKF path.
+
+| column | type | notes |
+|---|---|---|
+| `concept_path` | `text` PK | OKF identity, e.g. `tables/orders` |
+| `type` | `text` NOT NULL | the one required OKF field |
+| `title`, `description`, `resource` | `text` NULL | recommended OKF fields, typed for query |
+| `okf_timestamp` | `timestamptz` NULL | OKF `timestamp` (last meaningful change, producer-asserted) |
+| `tags` | `text[]` | GIN-indexed; namespacing + scoping (§4.16) |
+| `body_md` | `text` | the markdown body |
+| `frontmatter_extra` | `jsonb` | any non-recommended producer keys, lossless (OKF leniency) |
+| `is_core` | `boolean` default false | hot-core marker (§4.17); with `tags` gives global + per-domain cores |
+| `search_tsv` | `tsvector` GENERATED | from title/description/body; GIN-indexed (FTS) |
+| `embedding` | `vector(N)` | over the distilled concept; HNSW-indexed (semantic) |
+| `updated_at`, `created_at` | `timestamptz` | |
+
+**`concept_ledger`** — append-only full-text version history (§4.5). **Written only by the
+trigger in §5.3**, never by app code.
+
+| column | type | notes |
+|---|---|---|
+| `id` | `bigint` PK | |
+| `concept_path` | `text` | not FK-constrained (must survive concept deletion) |
+| `revision` | `int` | monotonic per path |
+| `type`,`title`,`description`,`resource`,`tags`,`body_md`,`frontmatter_extra`,`is_core` | — | full snapshot of the row at that revision (not a diff) |
+| `edited_by_principal_id` | `uuid` | human or agent principal |
+| `edit_proposal_id` | `uuid` NULL | links to the gate audit when the edit came from an agent |
+| `op` | `text` | `create` / `update` / `delete` |
+| `recorded_at` | `timestamptz` | time-travel axis for the UI |
+
+**`concept_provenance`** — many-dumps→one-concept source edges (§4.2, §4.6). Soft-invalidated,
+never deleted.
+
+| column | type | notes |
+|---|---|---|
+| `id` | `bigint` PK | |
+| `concept_path` | `text` | |
+| `raw_dump_id` | `uuid` FK→raw_dumps | |
+| `contribution_role` | `text` | e.g. `origin`, `refinement`, `correction` |
+| `cited_claims` | `jsonb` NULL | which claims this dump justified (memory-edit agent citation) |
+| `valid_at` | `timestamptz` | |
+| `invalid_at` | `timestamptz` NULL | soft-invalidation (set on re-derivation supersession) |
+| `invalidation_reason` | `text` NULL | machine-readable "why deprecated" |
+
+**`edit_proposals`** — every autonomous write attempt (§4.3). The audit spine of the gate.
+
+| column | type | notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `concept_path` | `text` | target (may not yet exist) |
+| `proposer` | `text` | `memory_edit` / `dreamer` |
+| `source_raw_dump_id` | `uuid` NULL | for memory-edit proposals |
+| `proposed_body_md`, `proposed_frontmatter` | — | the candidate |
+| `attempt` | `int` default 0 | bounded-repair counter (max 1 retry, §4.3) |
+| `status` | `text` | `pending`/`accepted`/`rejected`/`repairing`/`escalated` |
+| `created_at` | `timestamptz` | |
+
+**`judge_verdicts`** — one per judged proposal (privacy + quality).
+
+| column | type | notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `edit_proposal_id` | `uuid` FK | |
+| `screen` | `text` | `privacy` / `quality` |
+| `decision` | `text` | `accept`/`reject` |
+| `reason_class` | `text` | `pii`/`secret`/`redundant`/`vague`/`inconsistent`/… (routes handling) |
+| `rationale` | `text` | structured, actionable critique (feeds repair) |
+| `judge_model` | `text` | recorded; must differ from proposer model (§4.4) |
+| `created_at` | `timestamptz` | |
+
+**`review_queue`** — the owned human escalation sink (§4.3): repair-exhausted, privacy-
+ambiguous rejections, and advisory-flagged human edits.
+
+| column | type | notes |
+|---|---|---|
+| `id` | `uuid` PK | |
+| `kind` | `text` | `rejected_proposal` / `flagged_human_edit` |
+| `ref_id` | `uuid` | proposal or ledger row |
+| `priority` | `int` | triage lane |
+| `status` | `text` | `open`/`claimed`/`resolved` |
+| `owner_role` | `text` | who may triage (alerting on queue depth — §9) |
+| `created_at`, `resolved_at` | `timestamptz` | |
+
+**RBAC (§4.8, §4.9).**
+
+- **`roles`** — `(name PK)`; seeded `owner`,`admin`,`editor`,`reader` with a strict ordering.
+- **`principals`** — `(id PK, kind[human|service], display_name, external_subject NULL, role_name FK, disabled_at NULL)`. `external_subject` = OIDC `sub` for humans and OIDC service accounts; NULL for pure API-key services. Owners are reconciled from env at boot (§4.8).
+- **`api_keys`** — `(id PK, principal_id FK, hash, prefix, created_at, last_used_at, revoked_at NULL)`. Only the hash is stored; `prefix` (e.g. `okf_sk_ab12…`) enables display + lookup.
+
+**Import staging (§4.7).** `import_batches (id, actor_principal_id, source, status, created_at)`
+and `import_staged_concepts (id, batch_id, concept_path, incoming_body_md, incoming_frontmatter, collision[none|conflict], resolution[pending|accept_incoming|keep_local|merged], merged_body_md NULL)`.
+Producer-authored `index.md`/`log.md` are **not** staged (ignored on import, §4.7).
+
+**Queue.** The `procrastinate` schema (its own tables) lives in the same database, so a
+raw-dump insert and its derivation-job enqueue commit in one transaction (§4.1). Jobs:
+`derive_concept(raw_dump_id)`, `judge_proposal(edit_proposal_id)`, `dreamer_sweep()`,
+`purge_expired_dumps()`.
+
+### 5.3 The ledger trigger
+
+History is kept **out of application code** (§4.5): exactly one way to mutate a concept
+(CRUD on `concepts`), and the trigger guarantees history can never be skipped.
+
+- An `AFTER INSERT OR UPDATE OR DELETE ON concepts FOR EACH ROW` trigger writes a full
+  snapshot row into `concept_ledger`, computing `revision = coalesce(max(revision),0)+1` for
+  that `concept_path`, stamping `op` and `recorded_at`, and carrying the
+  `edited_by_principal_id` / `edit_proposal_id` supplied by the transaction (passed via a
+  transaction-local `SET LOCAL okf.actor = …` GUC that the trigger reads, so the writer
+  doesn't have to touch the ledger table).
+- The insert rides **inside the same transaction** as the CRUD write — both commit or neither
+  (§4.5). Concurrency is Postgres row locking + transactions; no app-level locking.
+- **Re-derivation** (§4.2) is a normal `UPDATE` (supersede current) → trigger appends the
+  prior state to the ledger (append history). Superseded `concept_provenance` edges get
+  `invalid_at`/`invalidation_reason` set in the same transaction.
+- `log.md` on export (§4.7) is a fold over `concept_ledger` grouped by `recorded_at::date`.
+- Diffs/time-travel in the console (§7 CUJ-H5) are computed on read from adjacent snapshots.
+
+### 5.4 Indexes for hybrid retrieval
+
+Per design-spec §4.14 (all in Postgres):
+
+- **FTS:** `GIN (search_tsv)` for lexical/exact (error codes, identifiers). `search_tsv` is a
+  `GENERATED` column so it can never drift from the body.
+- **Semantic:** `HNSW (embedding vector_cosine_ops)` for paraphrase/concept match; sized for
+  a 10⁴–10⁵ corpus (RAM-resident). `halfvec` an option to halve footprint.
+- **Fusion:** recall runs both and merges with Reciprocal Rank Fusion in the service layer
+  (§3); RRF is a pure function → unit-tested (§8).
+- **Tags/graph:** `GIN (tags)`; btree on `concept_links(target_path)` for "what links here /
+  orphans." Partial index `WHERE is_core` for the cheap `prime` read (§4.17).
+
+### 5.5 Migrations
+
+Alembic (via advanced-alchemy's migration integration, §3). The ledger trigger and the
+pgvector/pg_trgm extension creation ship as migration revisions (raw SQL in `op.execute`), so
+a fresh `docker compose up` + `migrate` produces the whole schema including triggers. Purge
+and dreamer schedules are procrastinate periodic tasks, not migrations.
+
+**Retention/PII note (§4.15).** v1 is the `expires_at` column + `purge_expired_dumps` sweep
+(default NULL = forever). The v2 three-tier crypto-shred + pseudonymised-snapshot model is
+*not* in this schema; its future seam is a per-dump key reference on `raw_dumps` and a
+`derivation_snapshots` table — noted so v1 migrations don't paint us into a corner.
 
 ---
 
