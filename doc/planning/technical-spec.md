@@ -71,17 +71,144 @@ implementation terms as they arise.
 
 ## 2. System context (recap)
 
-_A one-screen recap of the runtime topology from design-spec §3, so this doc stands on its
-own for an implementer. (Pending — TS1.)_
+Runtime topology (design-spec §3). Three planes over one Postgres:
+
+```mermaid
+flowchart LR
+    subgraph clients [Callers]
+      Agents([Agents]) & MCP([MCP clients]) & Humans([Humans])
+    end
+    subgraph web [Web tier - Litestar ASGI]
+      API[Machine API<br/>+ MCP adapter]
+      Console[Admin console<br/>htmx]
+    end
+    subgraph work [Worker tier - separate process]
+      W[procrastinate worker]
+      Crew[CrewAI agents:<br/>memory-edit / judge / dreamer]
+    end
+    PG[(Postgres:<br/>concepts + ledger + queue + graph)]
+    GW[Org AI gateway]
+    IdP[Keycloak / OIDC]
+
+    Agents & MCP -->|prime/recall/save| API
+    Humans -->|OIDC| Console
+    API -->|reads| PG
+    API ==>|save: insert+enqueue, 1 txn| PG
+    Console --> PG
+    W -->|dequeue| PG
+    W --> Crew
+    Crew -->|models| GW
+    Crew -->|proposals + judge| PG
+    API & Console -.->|verify token| IdP
+```
+
+Web tier acks fast and never runs an LLM on the hot path; the worker tier (a **separate
+process**) runs the CrewAI pipeline off the queue; Postgres is durability + queue + version
+store + graph at once. This section fixes how that maps to code.
 
 ---
 
 ## 3. Architecture — n-tier, following Litestar defaults
 
-_Layered structure (controllers → services → repositories → models/DTOs), dependency
-injection, auth guards/middleware, the sanitization decorator seam, the worker tier
-(procrastinate), the CrewAI agents, and the concrete module/package layout. Component
-diagram. Where each design-spec concept lives in code. (Pending — TS1.)_
+The "Litestar way" is defined less by the framework than by its official reference app
+([`litestar-fullstack`](https://github.com/litestar-org/litestar-fullstack)) plus
+[`advanced-alchemy`](https://github.com/litestar-org/advanced-alchemy) (the Litestar-org
+sibling that supplies the Service and Repository tiers). We follow it: a **4-tier layered
+design — Controller → Service → Repository → Model — organized domain-first** (vertical
+slices), with `advanced-alchemy` providing most CRUD so we don't hand-roll it.
+
+> **Load-bearing dependency note:** the repository/service pattern, base models, DI factories,
+> and Alembic wiring come from `advanced_alchemy.extensions.litestar`, whose API moves faster
+> than Litestar core — pin it explicitly (§10).
+
+### 3.1 The four tiers and the primitive at each
+
+| Tier | Litestar/advanced-alchemy primitive | Our use |
+|---|---|---|
+| **Controller** | `litestar.Controller` + `@get/@post/…`; `guards=`, `dependencies=` | Machine API (§6.2–6.4), console routes (§6.5); guards enforce RBAC |
+| **Service** | `advanced_alchemy.service.SQLAlchemyAsyncRepositoryService[Model]` (inner `Repo`) | Domain logic: distillation orchestration, RRF fusion, judge dispatch, import merge, hot-core selection |
+| **Repository** | `SQLAlchemyAsyncRepository[Model]` (via the service's inner `Repo`) | CRUD, filters, pagination, `with_for_update` locking |
+| **Model** | `advanced_alchemy.base.UUIDv7AuditBase` / `BigIntAuditBase` + SQLAlchemy 2.0 `Mapped` | The tables in §5 |
+
+- **Request/response shaping:** hand-written `msgspec.Struct` schemas per domain +
+  `service.to_schema(...)` / `data.to_dict()` (the current reference idiom), rather than
+  Litestar's `SQLAlchemyDTO`. DTOs remain the framework-native alternative if we want
+  auto-generated shapes; we pick **one convention (schema structs) and hold it**. Schemas are
+  also where we hide internal columns (e.g. `api_keys.hash`) from the wire.
+- **Dependency injection:** `litestar.di.Provide`, layered (app → router → controller →
+  handler, lower scope wins). We use advanced-alchemy's `create_service_dependencies(Service,
+  key=…, load=…, filters=…)` to wire a service + its filter/pagination deps in one call.
+  Filter lists inject as `Annotated[list[FilterTypes], Dependency(skip_validation=True)]`.
+- **Persistence config:** `SQLAlchemyAsyncConfig(..., session_config=AsyncSessionConfig(
+  expire_on_commit=False), before_send_handler="autocommit", alembic_config=…)` under
+  `SQLAlchemyPlugin`. `before_send_handler="autocommit"` commits on a 2xx and rolls back
+  otherwise — the save-path's insert+enqueue ride this single per-request transaction (§4.1).
+  `expire_on_commit=False` so objects stay usable when serializing to schemas.
+
+### 3.2 Auth, guards, and the sanitization seam
+
+- **Authentication (two extractors → one principal, §4.9/§6.1):** the OIDC/JWT path uses
+  Litestar's `litestar.security.jwt` plugin (validate against the org issuer, `retrieve_user_handler`
+  loads the principal); the **API-key path** is a custom `AbstractAuthenticationMiddleware`
+  (`authenticate_request` hashes the bearer, looks up `api_keys`, returns
+  `AuthenticationResult(user=principal, auth=…)`). Both populate `request.user` with the same
+  principal shape.
+- **RBAC (§4.8):** plain **guards** — `(connection, route_handler) -> None` raising
+  `PermissionDeniedException` — e.g. `requires_editor`, `requires_admin`, `requires_owner`.
+  Guards are cumulative and attach at controller/handler layer. This is where owner→admin→
+  editor→reader ordering is enforced.
+- **The sanitization seam (§4.15/§9)** is a controller-level dependency/decorator on the write
+  path that runs the shipped **XSS sanitizer** and any org-injected **PII scrubber** *before*
+  the raw dump is persisted — the documented extension point. Being DI-based, an org swaps in
+  its scrubber by overriding one provider, no core edit.
+
+### 3.3 The worker tier (procrastinate) and the agents
+
+Litestar has three "background" layers; we use them deliberately:
+
+- `BackgroundTask` (post-response, in-process, **not durable**) — only for trivial side
+  effects, never the pipeline.
+- App **lifespan / `on_startup`** — open/close the DB pool and the procrastinate connector so
+  the web process can *enqueue*.
+- **`procrastinate` worker as a separate process** (its own container/entrypoint) — runs the
+  durable heavy pipeline. The web tier enqueues (`task.defer_async(...)`) inside the save
+  transaction; the worker dequeues (`FOR UPDATE SKIP LOCKED`) and invokes the **CrewAI agents**
+  (memory-edit, judge, dreamer) against the org gateway. **The heavy worker never runs
+  in-process** with the ASGI app.
+
+The CrewAI agents live in the worker; the bundled CrewAI **auto-capture SAVE helper** (CUJ-A4)
+is the opposite direction — client-side code we ship for *external* crews, hooked to their
+event bus, not part of our worker.
+
+### 3.4 Module layout (domain-first)
+
+Following the reference app's vertical-slice structure:
+
+```
+src/okf/
+├── server/            # create_app() factory, plugin + router assembly, guards wiring
+├── db/
+│   ├── models/        # SQLAlchemy models (§5) — one file per table group
+│   └── migrations/    # Alembic (incl. ledger trigger + extension revisions)
+├── domain/            # one package per bounded context, each: controllers/ services/ schemas/ deps.py guards.py jobs/
+│   ├── memories/      # save (raw_dumps), the write hot path
+│   ├── recall/        # recall + prime (hybrid retrieval, hot core)
+│   ├── concepts/      # concept CRUD, history, console browse
+│   ├── pipeline/      # memory-edit, judge, dreamer job handlers + CrewAI crews
+│   ├── review/        # review/patrol queue
+│   ├── rbac/          # principals, roles, api_keys
+│   ├── portability/   # OKF import/export
+│   └── console/       # htmx admin UI (server-rendered partials)
+├── mcp/               # MCP server adapter (recall/prime) over the recall service
+├── lib/               # settings, DI helpers, sanitization seam, RRF, OKF (de)serialize, crypt, logging
+└── worker/            # procrastinate app + worker entrypoint (separate process)
+tests/                 # conftest (pytest-databases Postgres), integration/{routes,services}, unit/
+```
+
+Each design-spec concept has a home: ingestion → `domain/memories`; retrieval + hot core →
+`domain/recall`; the gate + dreamer → `domain/pipeline`; ledger/provenance → `db/models` +
+the trigger migration; import/export + `index.md`/`log.md` generation → `domain/portability`;
+auth/RBAC → `lib` (middleware) + `domain/rbac` (guards); the sanitization seam → `lib`.
 
 ---
 
