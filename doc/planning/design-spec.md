@@ -84,9 +84,9 @@ flowchart TD
     Agents([Other agents]) ==>|raw dump| API[Memories API]
     API -.->|202 fast| Agents
     Agents -->|recall query| API
-    API -->|read| C
+    API -->|hybrid recall| C
     C -.->|concepts| API
-    API ==>|write + enqueue<br/>one txn| Q[(PG queue)]
+    API ==>|sanitize +<br/>enqueue, one txn| Q[(PG queue)]
     Cron([Cron]) --> Dream[Dreamer]
     Q --> ME[Memory-edit agent]
     ME -->|proposal| J{Judge}
@@ -138,10 +138,11 @@ independently of the web tier).
 stages.
 
 1. **Capture.** The endpoint receives a raw dump — the calling agent's prompt context, a
-   conversation slice, whatever it wants remembered — and writes it verbatim and
-   **immutable** to a `raw_dumps` table. It enqueues a derivation job in the same
-   transaction and returns `202 Accepted` immediately. This is all that happens on the hot
-   path.
+   conversation slice, whatever it wants remembered — runs it through the **sanitization
+   seam** (§4.15), and writes it **immutable** to a `raw_dumps` table. It enqueues a
+   derivation job in the same transaction and returns `202 Accepted` immediately. This is
+   all that happens on the hot path. Raw dumps are **retained forever by default** but
+   subject to a configurable max-TTL knob for PII-conscious orgs (§4.15).
 2. **Derive.** A worker runs the **memory-edit agent**, which reads the raw dump and
    produces a *proposed* OKF concept (a new concept or an edit to an existing one). That
    proposal goes to the judge (§4.3). If accepted, it lands in the `concepts` table.
@@ -378,6 +379,134 @@ Because our SLOs are dominated by LLM latency in the callers' own pipelines, we 
 *write-acknowledgement* path and the *read* path hard, and let the *derivation* path take
 the time it needs.
 
+### 4.13 Scale — targets and topology
+
+**Decision.** Target **org-wide scale on a single Postgres primary plus read replicas**,
+sized against a ~1,000-engineer org as the reference deployment. No sharding, no separate
+search or vector cluster.
+
+**Why — do the math, and notice which axis is hard.** There are two scaling axes and only
+one bites.
+
+*Event throughput is trivial.* Every developer's Copilot plus bespoke agentic systems
+writing on task boundaries is order 50k saves/day ≈ 0.6/s average, ~6/s peak in one
+timezone. Recall fires more often — order 10⁵–10⁶ reads/day ≈ 12/s average, ~120/s peak.
+Postgres serves thousands of indexed reads/s on one node without noticing; writes barely
+register and the queue absorbs bursts. The genuinely expensive resource is **LLM derivation
+throughput**, not the database — ~6 sustained / ~60 peak concurrent derivations, which is a
+worker-fleet and token-budget question answered by scaling workers, not the DB.
+
+*Corpus size is the real axis — and it stays small because the judge dedups.* This is the
+load-bearing insight: the `concepts` table is a **curated wiki, not a log**. The memory-edit
+agent + judge exist to *consolidate* — merge into existing concepts, reject duplicates — so
+the distinct-knowledge count is sublinear in write volume and plateaus. An org's actual body
+of reusable knowledge is realistically **10⁴–10⁵ concepts** (Wikipedia is ~7M for *all human
+knowledge*). The `raw_dumps` firehose does grow unboundedly (10⁶–10⁸ rows over time), but
+**nobody runs recall against raw dumps** — partition them by time and archive cold ones to
+object storage. So the number governing recall is 10⁴–10⁵, which never stresses Postgres.
+
+*Topology falls out naturally.* Writes hit the primary (governed, serialized through the
+judge); **reads fan out to read replicas** because they never mutate. That is the path from
+~120/s to thousands/s of recall without leaving Postgres.
+
+**Rejected.** Sharding or a dedicated search/vector cluster (unjustified at a curated-wiki
+corpus size; violates in-a-box); treating the concepts table as an append log (would balloon
+it into the millions and defeat both recall quality and the whole point of the judge).
+
+### 4.14 Retrieval — hybrid lexical + semantic, inside Postgres
+
+**Decision.** **Hybrid retrieval from day one:** Postgres FTS (`tsvector` + GIN) for
+lexical/exact matches, `pgvector` (HNSW) for semantic matches, fused with **Reciprocal Rank
+Fusion**. Embeddings are computed over the **distilled concept** (not the raw dump) on write,
+during the derivation we already run. Everything stays in Postgres.
+
+**Why — FTS breaks on *meaning*, not scale.** At 10⁴–10⁵ concepts, FTS is fast essentially
+forever (people run PG FTS on 10M+ docs). Where it fails for *agent recall* is **lexical
+mismatch**: "how do I roll back a deploy" returns nothing against a concept titled "reverting
+a release" — no shared keywords — and the agent then re-derives knowledge the org already
+holds. That is the *primary* recall failure mode, and it is a quality problem, not a
+performance one. FTS is exactly right for the cases vectors are weak at (error codes,
+identifiers, function names — literal tokens), so we keep both and fuse. `pgvector` HNSW at
+our corpus size is sub-millisecond and RAM-resident (100k × 1536-dim × 4B ≈ 600MB, less with
+`halfvec`); it comfortably handles 1–10M vectors on one node, well beyond where we land.
+
+Starting FTS-only and "adding vectors later" is the seductive-but-wrong minimal move:
+recall-without-semantics is building the wrong thing, and retrofitting means a corpus-wide
+embedding backfill plus a query-path rewrite. The day-one cost is small — one embedding call
+on write (we're already doing an LLM pass there), one vector column, one HNSW index. The one
+real ongoing cost is a re-embed migration on embedding-model change, which at 10⁵ docs is a
+batch job, not a crisis.
+
+**Rejected.** FTS-only (fails on paraphrase — the dominant agent-recall case); a dedicated
+vector database (unneeded below millions of vectors; breaks in-a-box); embedding raw dumps
+(embed the curated concept, which is what recall returns).
+
+### 4.15 Distillation, sanitization, and the PII knobs
+
+This is where situated, sensitive input becomes generic, safe, org-collective knowledge.
+Sensible defaults out of the box; knobs an org twists when it must.
+
+**Distillation (in the memory-edit agent).** The agent's charter is to extract the
+**reusable, org-general lesson and drop the incidental** — anonymize actors, generalize the
+specific instance to the pattern, rewrite "the bug in `/Users/nathan/orders.py`" into "the
+orders service fails when…". This is what makes the corpus genuinely useful as
+human-readable internal documentation, not a pile of situated session transcripts.
+
+**The sanitization seam (a Litestar controller decorator).** A pluggable
+sanitize/validate step runs on the write controller *before* the raw dump is persisted. We
+**ship an XSS input sanitizer by default** — necessary regardless, because we render
+agent-generated *and* imported markdown into HTML in the console, so an unsanitized memory
+containing `<script>` is a stored-XSS vector the moment a human views the wiki. That shipped
+sanitizer is also the **worked example an org clones to drop in its own PII/secret-scrubbing
+validator at the same seam** — same decorator pattern, same insertion point, no core change.
+Defense in depth: we *also* allowlist-sanitize at markdown→HTML **render** time (nh3/ammonia
+-style), because markdown can embed raw HTML — input sanitization and safe rendering are two
+layers, not one.
+
+**Retention (a single config knob).** Postgres stores data at rest cheaply, so retention is a
+**PII concern, not a storage one**. Raw dumps are **retained forever by default**; an org
+sets a **max-TTL** on all raw sources via config and a scheduled purge sweep (reusing the
+queue/cron infra) enforces it. Default = no expiry.
+
+**Access asymmetry.** Concepts are org-readable; **raw dumps are not** — they hold the
+sensitive originals. Provenance stays auditable by owner/admin, but the recall API never
+exposes raw dumps, and raw dumps are candidates for encryption at rest.
+
+**The judge as a secondary privacy check.** Since every autonomous write already passes the
+judge (§4.3), the judge can additionally reject a proposed concept that still carries
+PII/secrets — a cheap second layer at an existing choke point.
+
+**Why.** PII policy is org- and legal-regime-specific; a general-purpose OSS deployable
+cannot know a deployer's obligations, so we ship the **mechanism** (decorator seam + TTL knob
++ access asymmetry), not a baked-in policy. Folding the PII hook into the XSS sanitizer we
+need anyway means one seam does double duty and the reference implementation is already in
+the box.
+
+**Rejected.** A heavyweight built-in PII engine as core (wrong default for most, and no
+engine fits every legal regime); scrubbing only via the LLM (never trust a model as a
+security boundary — the deterministic seam is the safety net).
+
+### 4.16 Namespacing, and the sensitive-deployment pattern
+
+**Decision.** **One global flat namespace, scoped only by tags.** Recall can filter by tag;
+that is the entire namespacing mechanism. We do **not** build per-team RBAC regions. For
+sensitive knowledge, the pattern is: **run a separate, dedicated instance of this service**
+under the owning team's control, and program that team's agents to recognize sensitive
+content and route those memories to their sensitive deployment.
+
+**Why.** A single shared namespace *is* the point — collective memory only compounds if it
+pools. Tags give humans navigability and agents scoped recall without a policy engine. And
+every org's sensitive-data RBAC is **novel every time**, so a configurable multi-tenant
+isolation layer in core is exactly the enterprise complexity that fits no one — the classic
+brain-rot we refuse. The unix answer instead: **one instance = one trust domain; scale
+privacy by deploying another box, not by growing a policy engine.** Composing dedicated
+instances is simpler to reason about, simpler to secure, and pushes the bespoke part to the
+only people who can get it right — the deploying team.
+
+**Rejected.** Configurable per-team RBAC regions / row-level multi-tenancy in core (bespoke
+for every org, unbounded policy surface, security footguns); a hierarchical namespace (tags
+are a richer, flatter graph — consistent with OKF's own link-graph model).
+
 ---
 
 ## 5. The caller contract — how agentic systems talk to us
@@ -418,15 +547,33 @@ is configuration (provider + endpoint). A generic corporate deployment should be
 adopt the service without reading our source — point it at their IdP, point it at their
 model, set the owners, go.
 
+**Read replicas for scale.** The primary handles governed writes; recall traffic fans out to
+Postgres read replicas (§4.13). This is the horizontal scaling knob for an org-wide
+deployment and it requires no application change beyond routing reads to a replica pool.
+
+**The sensitive-deployment pattern (documented, first-class).** This service is a **single
+trust domain** by design (§4.16). Sensitive or regulated knowledge does *not* get segregated
+by in-app RBAC regions — instead, run a **separate, dedicated instance** of the service under
+the owning team's control, with its own database, its own access rules, and (typically) its
+own PII scrubber wired into the sanitization seam and a tight max-TTL on raw dumps. The
+team's agents are programmed to recognize sensitive content and route those memories to their
+sensitive deployment rather than the org-wide one. You scale privacy by deploying another
+box, not by growing a policy engine.
+
 ---
 
 ## 7. Non-goals / explicitly deferred
 
 - **Not a filesystem-native OKF tool.** We speak OKF only at import/export; the DB is
   truth. (§2)
-- **Not a general search platform.** Postgres full-text / trigram is the ceiling for now;
-  no Elasticsearch.
-- **No multi-tenant isolation** in v1 unless a requirement surfaces — one box, one org.
+- **Not a general search platform.** Retrieval is hybrid FTS + `pgvector`, all inside
+  Postgres (§4.14); no Elasticsearch, no dedicated vector cluster.
+- **Not multi-tenant.** One instance = one trust domain (§4.16). Sensitive knowledge gets a
+  separate deployment, not an in-app isolation layer. Scoping within an instance is tags
+  only.
+- **No baked-in PII policy.** We ship the mechanism — sanitization seam + max-TTL knob +
+  access asymmetry (§4.15) — not a policy. Default is XSS-safe, forever-retention, no PII
+  redaction.
 - **No custom locking / eventual-consistency machinery** — Postgres transactions are the
   concurrency model. (§4.5)
 - **CLI shell-out LLM adapters may be a fast-follow**, not day-one, given the custom-wrapper
@@ -450,7 +597,13 @@ model, set the owners, go.
    structure on export, and do we ingest producer-authored `index.md`/`log.md` on import or
    regenerate ours? (Technical-spec detail, flagged here so it isn't forgotten.)
 6. **Local model floor** — which local model(s) do we validate the agents against, so
-   "works on my machine" has a defined baseline for the setup docs?
+   "works on my machine" has a defined baseline for the setup docs? This now also fixes the
+   **embedding model** floor (§4.14), since recall quality and re-embed cost both hinge on it.
+7. **Distillation vs. provenance tension under TTL** — if an org sets a short max-TTL on raw
+   dumps (§4.15), re-derivation from originals (§4.2) is no longer possible after purge. Do
+   we snapshot a scrubbed derivation-input alongside the concept so re-derivation survives
+   purge, or accept that short-TTL deployments forfeit re-derivation? Leaning "forfeit, and
+   say so."
 
 ---
 
@@ -467,3 +620,13 @@ model, set the owners, go.
 - **Ledger** — the append-only, full-text, trigger-maintained version history of concepts.
 - **Principal** — an authenticated actor: a human (via OIDC) or a service (via API key or
   OIDC client-credentials), each bound to an RBAC role.
+- **Distillation** — the memory-edit agent's job of turning a situated, sensitive raw dump
+  into a generic, reusable, de-identified concept fit for org-collective memory.
+- **Sanitization seam** — the pluggable validate/scrub step (a Litestar controller
+  decorator) on the write path; ships an XSS sanitizer by default and is the documented
+  insertion point for an org's PII/secret scrubber.
+- **Hybrid retrieval** — recall combining Postgres FTS (lexical) and `pgvector` (semantic),
+  fused with Reciprocal Rank Fusion; all inside Postgres.
+- **Sensitive deployment** — a separate, dedicated instance of this service run by a team to
+  hold sensitive/regulated knowledge under their own trust domain, rather than isolating it
+  via in-app RBAC.
