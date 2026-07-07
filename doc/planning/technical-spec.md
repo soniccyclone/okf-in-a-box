@@ -918,9 +918,68 @@ is the real gap.
 
 ## 9. Cross-cutting concerns
 
-_Config/settings, observability (reject-rate / queue-depth / cost dashboards, tracing),
-security (auth middleware, XSS sanitization seam, secrets, v2 crypto-shred hook), error
-handling and failure modes. (Pending — TS8.)_
+### 9.1 Configuration
+
+A single typed settings module (§3) read from env, instantiated once, injected via app
+state/plugin configs. Grouped: `AppSettings`, `DatabaseSettings`, `AuthSettings` (OIDC issuer,
+console client, `OKF_OWNER_SUBJECTS`), `ModelSettings` (per-agent models, embedding model, AI
+gateway base URL/key), `RetentionSettings` (raw-dump `MAX_TTL`, sanitizer/scrubber selection),
+`WorkerSettings` (dreamer cadence, dirtiness threshold, edit cap, cooldown, gateway budget).
+Secrets (DB URL, gateway key, JWT secret) come from env, never source. `.env.example`
+documents every var (§4.3). Defaults encode the design-spec's "sensible defaults": TTL off,
+XSS-on/PII-off, dreamer caps at the §4.4 values.
+
+### 9.2 Observability
+
+The design-spec makes specific signals load-bearing, so they're first-class, not
+afterthoughts:
+
+- **Judge reject-rate by reason class** (§4.3) — the memory-edit-agent regression alarm; a
+  spike means the proposer prompt/model went bad. Dashboarded on `/admin`; drives the dreamer
+  canary auto-halt (CUJ-P6).
+- **Review-queue depth + age** (§4.3) — the queue is only real if watched; **alert on depth
+  breach** and surface triage SLA, or it becomes a graveyard.
+- **Gateway cost/token spend per run and per day** (§4.4) — the dreamer circuit-breaker reads
+  this; expose spend so operators see it before a surprise bill.
+- **Queue health** — procrastinate depth, job latency, retry/backoff counts, dead jobs.
+- **Hot-path latency** — save-ack and recall/prime p50/p99 (the SLOs we optimize, §4.12),
+  separate from derivation latency (which we deliberately don't).
+
+Structured logging (structlog-style) with request/job correlation IDs; OpenTelemetry-friendly
+so an org can wire its own backend. Metrics via a `/metrics` endpoint.
+
+### 9.3 Security
+
+- **Auth** — dual-extractor middleware + RBAC guards (§3.2); API keys stored **hash-only**
+  with a display prefix; revocation immediate (`revoked_at` checked on every request).
+- **The sanitization seam** (§4.15) — ships an **XSS sanitizer** on the write path (agent-
+  *and* import-sourced markdown is rendered to HTML in the console, so unsanitized `<script>`
+  is a stored-XSS vector). Defense in depth: **also allowlist-sanitize at markdown→HTML render
+  time** (nh3/ammonia-style) in the console, since markdown embeds raw HTML — input
+  sanitization and safe rendering are two layers, not one. The same seam is the documented
+  insertion point for an org's PII/secret scrubber (DI override, no core edit).
+- **Universal privacy screen** (§4.3, CUJ-P2) — blocks secrets/PII for *every* writer,
+  human included, because a leak is author-independent.
+- **Raw-dump access asymmetry** (§4.15) — concepts are org-readable; `raw_dumps` are not
+  exposed by the recall API, are owner/admin-audit-only, and are candidates for encryption at
+  rest. The **v2 crypto-shred hook** (per-record key + `derivation_snapshots`) is a documented
+  future seam (§5.5), not v1.
+- **Secrets management** — env/secret-store only; no secret in the DB except the salted API-key
+  hashes and (v2) wrapped data keys.
+- **Never trust the model as a security boundary** — the deterministic sanitization seam is
+  the safety net; the LLM judge's privacy check is a *second* layer, not the primary one.
+
+### 9.4 Error handling & failure modes
+
+- **Fail fast, not silent** (repo principle): a critical capability that can't initialize
+  (DB, gateway on the worker) errors loudly and aborts rather than degrading quietly. The one
+  deliberate *graceful* degrade is recall → FTS-only if embeddings are down, and it's
+  **surfaced** (warning header/log), not silent.
+- **Hot path isolation** — gateway/worker failures never touch save/recall/prime; jobs
+  retry with backoff (procrastinate) and land in its dead-job set after exhaustion (surfaced,
+  §9.2), analogous to the review-queue-vs-graveyard rule.
+- **Consistent error envelope** (§6.1) via Litestar exception handlers.
+- **Idempotency** on save (§6.1) so retries don't double-insert.
 
 ---
 
