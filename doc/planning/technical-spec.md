@@ -533,21 +533,63 @@ central first, within an optional token/count `budget`. Cheap indexed read (part
 `is_core`), synchronous. Response: `{ "core": [ {concept_path, title, body_md, tags}… ],
 "budget_used" }`. This is advisory — the caller decides what to pin.
 
-**`GET /v1/recall?q=…&tags=…&type=…&k=…`** — hybrid retrieval (§4.14, CUJ-A2). Runs FTS +
-vector, fuses with RRF, returns top-`k` concepts with scores:
-`{ "results": [ {concept_path, title, description, body_md, tags, score}… ] }`. Also
-`GET /v1/concepts/{path}` for a direct fetch by identity, and
-`GET /v1/concepts/{path}/history` for the ledger view (used by console CUJ-H5; gated by role).
-All reads serve from `concepts`/`concept_ledger` only — no queue, no judge, no LLM; replica-
-routable (§4.13).
+**`GET /v1/recall?q=…&tags=…&type=…&k=…`** — hybrid *search* (§4.14, CUJ-A2). Runs FTS +
+vector, fuses with RRF, returns top-`k` concept **summaries** (not full bodies by default) +
+scores: `{ "results": [ {concept_path, title, description, tags, score}… ] }`. Recall is
+"which pages are relevant"; fetching a page's *contents* is a separate call below (pass
+`?include=body` to inline bodies when the caller would otherwise just re-fetch each hit).
 
-### 6.4 Machine API — MCP recall
+#### Page fetch — the literal wiki page contents
 
-An **MCP server exposes `recall` (and `prime`) as tools** (§5 design-spec, CUJ-A5) for any MCP
-client. **Save is not offered over MCP as a first-class tool** (structurally can't capture
-verbatim context — design-spec §5); at most a documented, lossy manual `save` tool for
-non-CrewAI callers, clearly labelled. The MCP server is a thin adapter over the same service
-layer as the HTTP recall.
+Recall and prime return *pointers and summaries*; this is how you get an actual page. Identity
+is the OKF path (§5.2), and a page is available in three representations via content
+negotiation (or an explicit `?format=`):
+
+**`GET /v1/concepts/{path}`** — one concept by identity. Representation:
+- `Accept: application/json` (default) → `{ concept_path, type, title, description, resource,
+  tags, is_core, okf_timestamp, updated_at, body_md, frontmatter }` — the structured page.
+- `Accept: text/markdown` (or `?format=md`) → the **literal OKF page**: YAML frontmatter +
+  markdown body, byte-for-byte what this concept serializes to in an export bundle. This is
+  the "give me the raw wiki page" call.
+- `Accept: text/html` (or `?format=html`) → the body rendered to **sanitized HTML** (through
+  the render-time allowlist, §9.3) — for a reading/preview surface without a client-side
+  markdown renderer.
+
+`404` if the path doesn't exist. This is also the **cross-link follow** endpoint: a concept
+body links to `/tables/customers` (§4.6 graph), and an agent or human resolves that link by
+fetching this path — graph traversal is just repeated page fetches.
+
+**`GET /v1/concepts/{path}/history`** — the revision list from the ledger (`{ revisions:
+[{revision, op, recorded_at, edited_by}…] }`); **`GET /v1/concepts/{path}/revisions/{n}`**
+returns the full page *as of* that revision (same three representations), so time-travel
+reading and diffing (CUJ-H5) work over the machine API too. Gated by role.
+
+#### Browse & navigation (progressive disclosure)
+
+The map, not just individual pages — the machine-API form of what the console browses (CUJ-H6)
+and what `index.md` encodes (§4.7):
+
+- **`GET /v1/concepts?path_prefix=…&tags=…&type=…&limit=&cursor=`** — list/enumerate pages
+  (summaries), filtered and cursor-paginated. "What pages exist under `tables/`?"
+- **`GET /v1/index?path=…`** — a directory's listing (child pages + subdirectories with their
+  descriptions), i.e. the same data that generates `index.md` for that directory — the
+  progressive-disclosure entry point an agent walks top-down instead of loading everything.
+- **`GET /v1/concepts/{path}/links?direction=out|in`** — the cross-link edges for a page
+  (`out` = what it references, `in` = what references it), so the concept *graph* is queryable,
+  not just followable one hop at a time.
+
+All reads here serve from `concepts` / `concept_ledger` / `concept_links` only — no queue, no
+judge, no LLM; replica-routable (§4.13). None of them touch `raw_dumps` (access asymmetry,
+§9.3).
+
+### 6.4 Machine API — MCP (read surface)
+
+An **MCP server exposes the read surface as tools** for any MCP client (§5 design-spec,
+CUJ-A5): `prime`, `recall` (search), `get_page` (fetch a page's contents by path, markdown by
+default), and `browse`/`index` (list + directory navigation). These are the same reads as
+§6.3 over a thin adapter on the same service layer. **Save is not offered over MCP as a
+first-class tool** (structurally can't capture verbatim context — design-spec §5); at most a
+documented, lossy manual `save` tool for non-CrewAI callers, clearly labelled.
 
 ### 6.5 Admin console (htmx)
 
@@ -611,8 +653,9 @@ script (§8). Each is tagged with an ID (`CUJ-<area><n>`) referenced by the test
 **Journey catalog** (specified in §7.2–§7.5):
 
 - **Agent-facing hot path (§7.2, TS6a):** `CUJ-A1` prime at startup · `CUJ-A2` recall
-  (hybrid) · `CUJ-A3` save a raw dump (202 + async) · `CUJ-A4` CrewAI event-bus auto-capture
-  SAVE · `CUJ-A5` recall over MCP.
+  (hybrid search) · `CUJ-A3` save a raw dump (202 + async) · `CUJ-A4` CrewAI event-bus
+  auto-capture SAVE · `CUJ-A5` recall over MCP · `CUJ-A6` fetch a page / follow a cross-link
+  (graph traversal).
 - **Autonomous pipeline (§7.3, TS6b):** `CUJ-P1` memory-edit distillation (dump → proposed
   concept, provenance + citation) · `CUJ-P2` privacy screen (blocks everyone) · `CUJ-P3`
   quality judge on an agent proposal (accept / reject) · `CUJ-P4` bounded repair retry ·
@@ -671,12 +714,24 @@ capturing); service unreachable → helper retries/queues locally then drops wit
 *Ref:* design-spec §5, §6.2.
 
 **CUJ-A5 — Recall over MCP.** *Actor:* a non-CrewAI MCP client (Claude Desktop, Cursor, …).
-*Trigger:* client invokes the `recall` (or `prime`) MCP tool. *Preconditions:* MCP server
-configured with a credential. *Steps:* (1) MCP `recall` tool call → (2) thin adapter → same
+*Trigger:* client invokes the `recall`/`prime`/`get_page`/`browse` MCP tool. *Preconditions:*
+MCP server configured with a credential. *Steps:* (1) MCP tool call → (2) thin adapter → same
 service layer as §6.3 → (3) results returned as tool output. *Outcome:* universal
-agent-invoked read across any MCP client. *Failure paths:* as CUJ-A2. *Note:* save is **not**
-a first-class MCP tool (can't capture verbatim context — design-spec §5); any manual MCP save
-is documented as lossy. *Ref:* §6.4.
+agent-invoked read across any MCP client. *Failure paths:* as CUJ-A2/A6. *Note:* save is
+**not** a first-class MCP tool (can't capture verbatim context — design-spec §5); any manual
+MCP save is documented as lossy. *Ref:* §6.4.
+
+**CUJ-A6 — Fetch a page / follow a cross-link.** *Actor:* calling agent or human. *Trigger:*
+the caller has a concept *path* — from a recall hit, a prime entry, a cross-link inside
+another page's body, or an index listing — and wants the actual page. *Preconditions:* valid
+credential; the path exists. *Steps:* (1) `GET /v1/concepts/{path}` with the desired
+representation (`json` structured / `md` literal OKF page / `html` sanitized render, §6.3);
+(2) service reads the `concepts` row (or a `revisions/{n}` snapshot for a past version);
+(3) returns the page. To traverse the graph, the caller repeats this per cross-link, or reads
+`…/links` to see out/in edges first. *Outcome:* the caller gets literal page contents and can
+walk the wiki graph link-by-link — the read counterpart to recall's "which pages," this is
+"the page itself." *Failure paths:* unknown path → `404`; unauthorized revision access →
+`403`; never touches `raw_dumps` (§9.3). *Ref:* §6.3, §4.5, §4.6.
 
 ### 7.3 Autonomous pipeline — memory-edit, judge, dreamer
 
@@ -893,6 +948,7 @@ paths / invariants**. Load-bearing invariants to assert explicitly:
 |---|---|
 | A3 save | `202` fast; a `raw_dumps` row **and** a queued job exist in one txn; **no `concepts` row created synchronously** |
 | A1 prime / A2 recall | served from `concepts` only (no job enqueued); RRF order; empty-core/empty-result = `200 []`; recall degrades to FTS-only if embeddings down |
+| A6 page fetch | `md` representation is byte-identical to the export serialization; `html` is allowlist-sanitized; unknown path `404`; `…/links` returns correct in/out edges; no `raw_dumps` access |
 | A4 CrewAI capture | verbatim `messages` captured (not `TaskOutput`); **CI test fails if the pinned CrewAI event schema drifts** (§3.3) |
 | P1→P3 pipeline | dump → proposal → (fake) verdict → concept + **ledger row** + **provenance edge** with citation |
 | P2 privacy | a planted secret is blocked for **both** an agent proposal and a human commit |
